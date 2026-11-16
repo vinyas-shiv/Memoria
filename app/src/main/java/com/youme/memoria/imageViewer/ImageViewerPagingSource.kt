@@ -50,21 +50,21 @@ class ImageViewerPagingSource(
         val ctx = appContext
         if (ctx != null) {
             val selectedBuckets = FolderPrefs(ctx).selectedBuckets.first()
-            if (selectedBuckets.any { it.startsWith(MediaScannerHelper.FS_BUCKET_PREFIX) }) {
-                val allEntries = MediaScannerHelper.getUnifiedGalleryEntries(ctx, selectedBuckets)
-                if (offset >= allEntries.size || limit <= 0) return emptyList()
-                val slice = allEntries.subList(offset, minOf(offset + limit, allEntries.size))
-                return slice.map { entry ->
-                    val (w, h) = if (entry.width > 0 && entry.height > 0) {
-                        entry.width to entry.height
-                    } else {
-                        ImageSizeUtil.getImageDimensions(ctx, entry.uri) ?: (1 to 1)
-                    }
-                    ImageUriItem(entry.id, entry.uri, w, h)
+            val allEntries = MediaScannerHelper.getUnifiedGalleryEntries(ctx, selectedBuckets)
+            if (offset >= allEntries.size || limit <= 0) return emptyList()
+            val slice = allEntries.subList(offset, minOf(offset + limit, allEntries.size))
+            return slice.map { entry ->
+                val (w, h) = if (entry.width > 0 && entry.height > 0) {
+                    entry.width to entry.height
+                } else {
+                    ImageSizeUtil.getImageDimensions(ctx, entry.uri) ?: (1 to 1)
                 }
+                ImageUriItem(entry.id, entry.uri, w, h)
             }
         }
 
+        val selection = "${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} LIKE ?"
+        val selectionArgs = arrayOf("%WhatsApp%")
         val projection = arrayOf(
             MediaStore.Images.Media._ID,
             MediaStore.Images.Media.WIDTH,
@@ -76,11 +76,16 @@ class ImageViewerPagingSource(
                 putInt(ContentResolver.QUERY_ARG_LIMIT, limit)
                 putInt(ContentResolver.QUERY_ARG_OFFSET, offset)
                 putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, sort)
+                putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
+                putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, selectionArgs)
             }
             contentResolver.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, projection, b, null)
         } else {
             contentResolver.query(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI, projection, null, null,
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                selection,
+                selectionArgs,
                 "$sort LIMIT $limit OFFSET $offset"
             )
         }
