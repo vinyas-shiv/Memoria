@@ -176,11 +176,7 @@ class imageViewerActivity : AppCompatActivity() {
 
     private suspend fun queryTotalGalleryCount(): Int = withContext(Dispatchers.IO) {
         val selectedBuckets = FolderPrefs(applicationContext).selectedBuckets.first()
-        if (selectedBuckets.any { it.startsWith(MediaScannerHelper.FS_BUCKET_PREFIX) }) {
-            MediaScannerHelper.getUnifiedGalleryEntries(applicationContext, selectedBuckets).size
-        } else {
-            queryAllImageIds(contentResolver).size
-        }
+        MediaScannerHelper.getUnifiedGalleryEntries(applicationContext, selectedBuckets).size
     }
 
     suspend fun queryAllImageIds(contentResolver: ContentResolver): LongArray =
@@ -189,7 +185,8 @@ class imageViewerActivity : AppCompatActivity() {
             contentResolver.query(
                 MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
                 arrayOf(MediaStore.Images.Media._ID),
-                null, null,
+                "${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} LIKE ?",
+                arrayOf("%WhatsApp%"),
                 "${MediaStore.Images.Media.DATE_TAKEN} DESC, ${MediaStore.Images.Media._ID} DESC"
             )?.use {
                 while (it.moveToNext()) ids.add(it.getLong(0))
