@@ -152,22 +152,20 @@ class IndexingViewModel(
                 val currentSnapshot = imglistMutex.withLock { imglist.toList() }
                 val alreadyExists = repo.alreadyExistsList().map { it.uri.toUri() }.toMutableList()
                 val imgSet = currentSnapshot.toHashSet()
-                val inAlbums = dao.albumPhotoUris().map { it.uri }.toHashSet()
 
-                val toDelete = alreadyExists.filter { uri ->
-                    if (uri in imgSet) return@filter false
-                    if (uri.toString() in inAlbums) {
-                        !MediaScannerHelper.mediaExists(appContext, uri)
-                    } else {
-                        true
+                // Only prune embeddings whose source file was actually deleted from device storage;
+                // keep embeddings for temporarily unchecked folders so toggling folders never forces re-indexing.
+                val toDelete = withContext(Dispatchers.IO) {
+                    alreadyExists.filter { uri ->
+                        if (uri in imgSet) false
+                        else !MediaScannerHelper.mediaExists(appContext, uri)
                     }
                 }
 
-                if (toDelete.isNotEmpty() && currentSnapshot.isNotEmpty()) {
-                    Toast.makeText(appContext, "Found ${toDelete.size} missing image(s). Deleting them now.", Toast.LENGTH_SHORT).show()
-                    viewModelScope.launch {
-                        repo.pruneDeletedPhotos(toDelete)
-                    }
+                if (toDelete.isNotEmpty()) {
+                    Toast.makeText(appContext, "Removed ${toDelete.size} deleted image(s) from index.", Toast.LENGTH_SHORT).show()
+                    repo.pruneDeletedPhotos(toDelete)
+                    getFormattedDatabaseSize("photo_db")
                 }
 
                 val indexedInScope = alreadyExists.count { it in imgSet }
