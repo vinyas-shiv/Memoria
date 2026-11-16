@@ -4,63 +4,65 @@ import android.net.Uri
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.widget.ImageView
 import android.widget.TextView
-import androidx.constraintlayout.widget.ConstraintLayout
-import androidx.core.view.isVisible
-import androidx.paging.PagingData
 import androidx.paging.PagingDataAdapter
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import androidx.recyclerview.widget.StaggeredGridLayoutManager
-import com.bumptech.glide.Glide
-import com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions
-import com.google.android.material.card.MaterialCardView
 import com.youme.memoria.Album.AlbumViewer.AlbumViewerAdapter
-import com.youme.memoria.ImageLoading.ImagePagingAdapter
 import com.youme.memoria.R
 import com.youme.memoria.roomCach.AlbumPhotoEntity
-import com.youme.memoria.roomCach.AlbumsList
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
-class GalleryDateAdapter(private val onClick : (Uri)-> Unit) :
+class GalleryDateAdapter(private val onClick: (Uri) -> Unit) :
     PagingDataAdapter<DateImageBlocks, GalleryDateAdapter.MyViewHolder>(DIFF_CALLBACK) {
 
-    class MyViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
-        val recyclerView: RecyclerView = itemView.findViewById<RecyclerView>(R.id.rec)
-        val date: TextView = itemView.findViewById<TextView>(R.id.textView17)
+    private val sharedViewPool = RecyclerView.RecycledViewPool().apply {
+        setMaxRecycledViews(0, 36)
+    }
+
+    class MyViewHolder(
+        itemView: View,
+        sharedPool: RecyclerView.RecycledViewPool,
+        onItemTapped: (Uri) -> Unit
+    ) : RecyclerView.ViewHolder(itemView) {
+        val recyclerView: RecyclerView = itemView.findViewById(R.id.rec)
+        val date: TextView = itemView.findViewById(R.id.textView17)
+        var currentImages: List<Uri> = emptyList()
+
+        val childAdapter = AlbumViewerAdapter(
+            emptyList(),
+            { _, _ -> },
+            { index ->
+                currentImages.getOrNull(index)?.let(onItemTapped)
+            },
+            false
+        )
+
+        init {
+            val gridLayoutManager = GridLayoutManager(itemView.context, 3).apply {
+                initialPrefetchItemCount = 6
+            }
+            recyclerView.apply {
+                layoutManager = gridLayoutManager
+                setRecycledViewPool(sharedPool)
+                setHasFixedSize(false)
+                itemAnimator = null
+                adapter = childAdapter
+            }
+        }
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): MyViewHolder {
         val view = LayoutInflater.from(parent.context)
             .inflate(R.layout.data_image_items, parent, false)
-
-        return MyViewHolder(view)
+        return MyViewHolder(view, sharedViewPool, onClick)
     }
 
     override fun onBindViewHolder(holder: MyViewHolder, position: Int) {
         val dateBlock = getItem(position) ?: return
-
-
-        val Adapter = AlbumViewerAdapter(emptyList(), { _, _ -> }, {
-            onClick(dateBlock.images[it].uri)
-        },false)
-
         holder.date.text = dateBlock.dataTaken
-
-
-        holder.recyclerView.apply {
-            this.layoutManager = GridLayoutManager(holder.itemView.context,3)
-            adapter = Adapter
-        }
-
-        Adapter.submitData(
+        holder.currentImages = dateBlock.images.map { it.uri }
+        holder.childAdapter.submitData(
             dateBlock.images.map {
                 AlbumPhotoEntity("", it.uri.toString())
             }
@@ -70,7 +72,6 @@ class GalleryDateAdapter(private val onClick : (Uri)-> Unit) :
     companion object {
         private val DIFF_CALLBACK =
             object : DiffUtil.ItemCallback<DateImageBlocks>() {
-
                 override fun areItemsTheSame(
                     oldItem: DateImageBlocks,
                     newItem: DateImageBlocks
@@ -86,4 +87,4 @@ class GalleryDateAdapter(private val onClick : (Uri)-> Unit) :
                 }
             }
     }
-}
+    }
