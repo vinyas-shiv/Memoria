@@ -1,7 +1,6 @@
-package  com.youme.memoria.ImageLoading
+package com.youme.memoria.ImageLoading
 
 import android.net.Uri
-import android.os.Parcelable
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -10,27 +9,32 @@ import androidx.paging.PagingDataAdapter
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
 import com.bumptech.glide.Glide
-import com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions
+import com.bumptech.glide.load.DecodeFormat
+import com.bumptech.glide.load.engine.DiskCacheStrategy
 import com.youme.memoria.R
+
 data class ImageUriItem(
     val id: Long,
     val uri: Uri,
     val width: Int,
     val height: Int
-)  {
+) {
     val ratio: Float get() = if (width > 0) height.toFloat() / width.toFloat() else 1f
 }
+
 class ImageDiffCallback : DiffUtil.ItemCallback<ImageUriItem>() {
     override fun areItemsTheSame(old: ImageUriItem, new: ImageUriItem) = old.id == new.id
     override fun areContentsTheSame(old: ImageUriItem, new: ImageUriItem) = old == new
 }
 
-class ImagePagingAdapter(val spanCount: Int = 2,val onImageClick :(ImageView,Int) -> Unit) : PagingDataAdapter<ImageUriItem, ImagePagingAdapter.VH>(ImageDiffCallback()) {
+class ImagePagingAdapter(
+    val spanCount: Int = 2,
+    val onImageClick: (ImageView, Int) -> Unit
+) : PagingDataAdapter<ImageUriItem, ImagePagingAdapter.VH>(ImageDiffCallback()) {
 
     class VH(view: View) : RecyclerView.ViewHolder(view) {
         val imageView: ImageView = view.findViewById(R.id.imageView)
     }
-
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
         val view = LayoutInflater.from(parent.context)
@@ -40,17 +44,25 @@ class ImagePagingAdapter(val spanCount: Int = 2,val onImageClick :(ImageView,Int
 
     override fun onBindViewHolder(holder: VH, position: Int) {
         val item = getItem(position) ?: return
-        val baseWidth = holder.itemView.resources.displayMetrics.widthPixels / spanCount
-        holder.imageView.layoutParams.height = (baseWidth * item.ratio).toInt()
+        val baseWidth = (holder.itemView.resources.displayMetrics.widthPixels / spanCount).coerceAtLeast(1)
+        val targetHeight = (baseWidth * item.ratio).toInt().coerceIn(1, baseWidth * 3)
+        holder.imageView.layoutParams.height = targetHeight
 
-        Glide.with(holder.itemView.context)
+        Glide.with(holder.imageView)
             .load(item.uri)
+            .override(baseWidth, targetHeight)
+            .format(DecodeFormat.PREFER_RGB_565)
+            .diskCacheStrategy(DiskCacheStrategy.RESOURCE)
             .error(R.drawable.baseline_broken_image_24)
-            .transition(DrawableTransitionOptions.withCrossFade())
             .into(holder.imageView)
 
         holder.itemView.setOnClickListener {
-            onImageClick(holder.imageView,position)
+            onImageClick(holder.imageView, position)
         }
+    }
+
+    override fun onViewRecycled(holder: VH) {
+        super.onViewRecycled(holder)
+        Glide.with(holder.imageView).clear(holder.imageView)
     }
 }
