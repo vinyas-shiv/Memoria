@@ -33,19 +33,32 @@ object MediaScannerHelper {
         "sent", "private"
     )
 
-    private val KNOWN_ANDROID_MEDIA_SUBPATHS = listOf(
+    private val WHATSAPP_SCAN_ROOTS = listOf(
         "Android/media/com.whatsapp",
         "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images",
         "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images/Sent",
         "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images/Private",
+        "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Documents",
         "Android/media/com.whatsapp.w4b",
         "Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Images",
         "Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Images/Sent",
         "Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Images/Private",
+        "WhatsApp",
         "WhatsApp/Media/WhatsApp Images",
         "WhatsApp/Media/WhatsApp Images/Sent",
-        "WhatsApp/Media/WhatsApp Images/Private"
+        "WhatsApp/Media/WhatsApp Images/Private",
+        "WhatsApp Business",
+        "Pictures/WhatsApp",
+        "DCIM/WhatsApp"
     )
+
+    fun isWhatsAppFolder(relativePath: String?, bucketName: String? = null): Boolean {
+        val pathMatch = !relativePath.isNullOrBlank() &&
+            relativePath.contains("whatsapp", ignoreCase = true)
+        val nameMatch = !bucketName.isNullOrBlank() &&
+            bucketName.contains("whatsapp", ignoreCase = true)
+        return pathMatch || nameMatch
+    }
 
     fun hasAllFilesAccess(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -105,7 +118,6 @@ object MediaScannerHelper {
         runCatching {
             @Suppress("DEPRECATION")
             context.externalMediaDirs?.filterNotNull()?.forEach { mediaDir ->
-                // .../Android/media/<package> -> 3 parents up is storage volume root
                 val root = mediaDir.parentFile?.parentFile?.parentFile
                 if (root != null && root.exists()) {
                     roots.putIfAbsent(root.absolutePath.trimEnd('/'), root)
@@ -131,7 +143,7 @@ object MediaScannerHelper {
         return normalizeRelativePath(dir.name)
     }
 
-    private fun walkHiddenImageFiles(
+    private fun walkWhatsAppHiddenImageFiles(
         context: Context,
         excludePaths: Set<String>,
         onFile: (File, String) -> Unit
@@ -161,39 +173,16 @@ object MediaScannerHelper {
                         val folderRel = relPath ?: getRelativeFolderPath(context, dir).also {
                             relPath = it
                         }
-                        onFile(child, folderRel)
+                        if (isWhatsAppFolder(folderRel, dir.name)) {
+                            onFile(child, folderRel)
+                        }
                     }
                 }
             }
         }
 
         for (root in getStorageRoots(context)) {
-            val topChildren = try {
-                root.listFiles()
-            } catch (_: SecurityException) {
-                null
-            }
-            topChildren?.forEach { child ->
-                val name = child.name
-                if (name.startsWith(".")) return@forEach
-                if (child.isDirectory) {
-                    if (!name.equals("Android", ignoreCase = true)) {
-                        walkDir(child, 1)
-                    }
-                } else if (child.isFile && child.length() > 0L && isImageFileName(name)) {
-                    val filePath = child.absolutePath
-                    if (filePath !in excludePaths && seenFiles.add(filePath)) {
-                        onFile(child, "")
-                    }
-                }
-            }
-
-            val androidMedia = File(root, "Android/media")
-            if (androidMedia.exists()) {
-                walkDir(androidMedia, 2)
-            }
-
-            for (subPath in KNOWN_ANDROID_MEDIA_SUBPATHS) {
+            for (subPath in WHATSAPP_SCAN_ROOTS) {
                 val target = File(root, subPath)
                 if (target.exists() && target.isDirectory) {
                     val depth = subPath.count { it == '/' } + 1
@@ -250,9 +239,6 @@ object MediaScannerHelper {
                     val bucketId = cursor.getString(idCol) ?: continue
                     val rawName = cursor.getString(nameCol) ?: "Unknown"
                     val dataPath = if (dataCol >= 0) cursor.getString(dataCol) else null
-                    if (!dataPath.isNullOrEmpty()) {
-                        mediaStorePaths.add(dataPath)
-                    }
                     val rawRel = if (relCol >= 0) cursor.getString(relCol) else null
                     val relPath = if (!rawRel.isNullOrBlank()) {
                         normalizeRelativePath(rawRel)
@@ -260,6 +246,12 @@ object MediaScannerHelper {
                         getRelativeFolderPath(context, File(dataPath).parentFile)
                     } else {
                         ""
+                    }
+
+                    if (!isWhatsAppFolder(relPath, rawName)) continue
+
+                    if (!dataPath.isNullOrEmpty()) {
+                        mediaStorePaths.add(dataPath)
                     }
 
                     val existing = byBucketId[bucketId]
@@ -282,14 +274,14 @@ object MediaScannerHelper {
             }
         }
 
-        walkHiddenImageFiles(context, mediaStorePaths) { file, relPath ->
+        walkWhatsAppHiddenImageFiles(context, mediaStorePaths) { file, relPath ->
             val matchedBucketId = if (relPath.isNotEmpty()) bucketIdByRelPath[relPath] else null
             val bucketId = matchedBucketId ?: "$FS_BUCKET_PREFIX$relPath"
             val existing = byBucketId[bucketId]
             if (existing != null) {
                 existing.count++
             } else {
-                val fallback = file.parentFile?.name ?: "Root"
+                val fallback = file.parentFile?.name ?: "WhatsApp"
                 val displayName = formatFolderDisplayName(relPath, fallback)
                 val displayPath = relPath.ifEmpty { "/" }
                 byBucketId[bucketId] = MutableFolder(
@@ -323,18 +315,20 @@ object MediaScannerHelper {
         val result = ArrayList<Uri>()
         val mediaStorePaths = HashSet<String>()
 
-        val selectAll = selectedBuckets.isEmpty()
         val mediaBucketIds = selectedBuckets.filter { !it.startsWith(FS_BUCKET_PREFIX) }.toHashSet()
         val fsRelPaths = selectedBuckets
             .filter { it.startsWith(FS_BUCKET_PREFIX) }
             .map { normalizeRelativePath(it.removePrefix(FS_BUCKET_PREFIX)) }
+            .filter { isWhatsAppFolder(it) }
             .toHashSet()
+        val selectAllWhatsApp = selectedBuckets.isEmpty()
         val selectedRelPathsFromMediaBuckets = HashSet<String>()
 
         val projection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             arrayOf(
                 MediaStore.Images.Media._ID,
                 MediaStore.Images.Media.BUCKET_ID,
+                MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
                 MediaStore.Images.Media.RELATIVE_PATH,
                 MediaStore.Images.Media.DATA,
                 MediaStore.Images.Media.DATE_ADDED
@@ -343,6 +337,7 @@ object MediaScannerHelper {
             arrayOf(
                 MediaStore.Images.Media._ID,
                 MediaStore.Images.Media.BUCKET_ID,
+                MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
                 MediaStore.Images.Media.DATA,
                 MediaStore.Images.Media.DATE_ADDED
             )
@@ -360,6 +355,7 @@ object MediaScannerHelper {
             )?.use { cursor ->
                 val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
                 val bucketCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_ID)
+                val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
                 val dataCol = cursor.getColumnIndex(MediaStore.Images.Media.DATA)
                 val relCol = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     cursor.getColumnIndex(MediaStore.Images.Media.RELATIVE_PATH)
@@ -368,10 +364,8 @@ object MediaScannerHelper {
                 while (cursor.moveToNext()) {
                     val id = cursor.getLong(idCol)
                     val bucketId = cursor.getString(bucketCol) ?: ""
+                    val rawName = cursor.getString(nameCol) ?: ""
                     val dataPath = if (dataCol >= 0) cursor.getString(dataCol) else null
-                    if (!dataPath.isNullOrEmpty()) {
-                        mediaStorePaths.add(dataPath)
-                    }
                     val rawRel = if (relCol >= 0) cursor.getString(relCol) else null
                     val relPath = if (!rawRel.isNullOrBlank()) {
                         normalizeRelativePath(rawRel)
@@ -381,7 +375,13 @@ object MediaScannerHelper {
                         ""
                     }
 
-                    val include = selectAll ||
+                    if (!isWhatsAppFolder(relPath, rawName)) continue
+
+                    if (!dataPath.isNullOrEmpty()) {
+                        mediaStorePaths.add(dataPath)
+                    }
+
+                    val include = selectAllWhatsApp ||
                         bucketId in mediaBucketIds ||
                         (relPath.isNotEmpty() && relPath in fsRelPaths)
 
@@ -400,21 +400,22 @@ object MediaScannerHelper {
             }
         }
 
-        if (selectAll) {
+        if (selectAllWhatsApp) {
             val hiddenFiles = ArrayList<File>()
-            walkHiddenImageFiles(context, mediaStorePaths) { file, _ ->
+            walkWhatsAppHiddenImageFiles(context, mediaStorePaths) { file, _ ->
                 hiddenFiles.add(file)
             }
             hiddenFiles.sortByDescending { it.lastModified() }
             hiddenFiles.forEach { result.add(Uri.fromFile(it)) }
         } else {
-            val targetRelPaths = fsRelPaths + selectedRelPathsFromMediaBuckets
+            val targetRelPaths = (fsRelPaths + selectedRelPathsFromMediaBuckets)
+                .filter { isWhatsAppFolder(it) }
             if (targetRelPaths.isNotEmpty()) {
                 val hiddenFiles = ArrayList<File>()
                 val seen = HashSet<String>()
                 for (root in getStorageRoots(context)) {
                     for (relPath in targetRelPaths) {
-                        val dir = if (relPath.isEmpty()) root else File(root, relPath.trimEnd('/'))
+                        val dir = File(root, relPath.trimEnd('/'))
                         val children = try {
                             dir.listFiles()
                         } catch (_: SecurityException) {
@@ -444,17 +445,42 @@ object MediaScannerHelper {
         context: Context,
         selectedBuckets: Set<String>
     ): List<GalleryMediaEntry> {
-        val entries = ArrayList<GalleryMediaEntry>()
+        val selectedEntries = ArrayList<GalleryMediaEntry>()
+        val allWhatsAppEntries = ArrayList<GalleryMediaEntry>()
         val mediaStorePaths = HashSet<String>()
 
-        val projection = arrayOf(
-            MediaStore.Images.Media._ID,
-            MediaStore.Images.Media.DATE_TAKEN,
-            MediaStore.Images.Media.DATE_ADDED,
-            MediaStore.Images.Media.WIDTH,
-            MediaStore.Images.Media.HEIGHT,
-            MediaStore.Images.Media.DATA
-        )
+        val mediaBucketIds = selectedBuckets.filter { !it.startsWith(FS_BUCKET_PREFIX) }.toHashSet()
+        val fsRelPaths = selectedBuckets
+            .filter { it.startsWith(FS_BUCKET_PREFIX) }
+            .map { normalizeRelativePath(it.removePrefix(FS_BUCKET_PREFIX)) }
+            .filter { isWhatsAppFolder(it) }
+            .toHashSet()
+        val selectedRelPathsFromMediaBuckets = HashSet<String>()
+
+        val projection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            arrayOf(
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.BUCKET_ID,
+                MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
+                MediaStore.Images.Media.RELATIVE_PATH,
+                MediaStore.Images.Media.DATE_TAKEN,
+                MediaStore.Images.Media.DATE_ADDED,
+                MediaStore.Images.Media.WIDTH,
+                MediaStore.Images.Media.HEIGHT,
+                MediaStore.Images.Media.DATA
+            )
+        } else {
+            arrayOf(
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.BUCKET_ID,
+                MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
+                MediaStore.Images.Media.DATE_TAKEN,
+                MediaStore.Images.Media.DATE_ADDED,
+                MediaStore.Images.Media.WIDTH,
+                MediaStore.Images.Media.HEIGHT,
+                MediaStore.Images.Media.DATA
+            )
+        }
         val sortOrder =
             "${MediaStore.Images.Media.DATE_TAKEN} DESC, ${MediaStore.Images.Media._ID} DESC"
 
@@ -467,81 +493,97 @@ object MediaScannerHelper {
                 sortOrder
             )?.use { cursor ->
                 val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                val bucketCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_ID)
+                val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
                 val dateTakenCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
                 val dateAddedCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
                 val widthCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
                 val heightCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
                 val dataCol = cursor.getColumnIndex(MediaStore.Images.Media.DATA)
+                val relCol = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    cursor.getColumnIndex(MediaStore.Images.Media.RELATIVE_PATH)
+                } else -1
 
                 while (cursor.moveToNext()) {
                     val id = cursor.getLong(idCol)
+                    val bucketId = cursor.getString(bucketCol) ?: ""
+                    val rawName = cursor.getString(nameCol) ?: ""
                     val dataPath = if (dataCol >= 0) cursor.getString(dataCol) else null
+                    val rawRel = if (relCol >= 0) cursor.getString(relCol) else null
+                    val relPath = if (!rawRel.isNullOrBlank()) {
+                        normalizeRelativePath(rawRel)
+                    } else if (!dataPath.isNullOrEmpty()) {
+                        getRelativeFolderPath(context, File(dataPath).parentFile)
+                    } else {
+                        ""
+                    }
+
+                    if (!isWhatsAppFolder(relPath, rawName)) continue
+
                     if (!dataPath.isNullOrEmpty()) {
                         mediaStorePaths.add(dataPath)
                     }
+
                     val rawDateTaken = cursor.getLong(dateTakenCol)
                     val dateMillis = if (rawDateTaken > 0L) {
                         rawDateTaken
                     } else {
                         cursor.getLong(dateAddedCol) * 1000L
                     }
-                    entries.add(
-                        GalleryMediaEntry(
-                            id = id,
-                            uri = ContentUris.withAppendedId(
-                                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                                id
-                            ),
-                            dateTaken = dateMillis,
-                            width = cursor.getInt(widthCol),
-                            height = cursor.getInt(heightCol)
-                        )
+                    val entry = GalleryMediaEntry(
+                        id = id,
+                        uri = ContentUris.withAppendedId(
+                            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                            id
+                        ),
+                        dateTaken = dateMillis,
+                        width = cursor.getInt(widthCol),
+                        height = cursor.getInt(heightCol)
                     )
-                }
-            }
-        }
+                    allWhatsAppEntries.add(entry)
 
-        val fsRelPaths = selectedBuckets
-            .filter { it.startsWith(FS_BUCKET_PREFIX) }
-            .map { normalizeRelativePath(it.removePrefix(FS_BUCKET_PREFIX)) }
-            .toHashSet()
-
-        if (fsRelPaths.isNotEmpty()) {
-            val seen = HashSet<String>()
-            for (root in getStorageRoots(context)) {
-                for (relPath in fsRelPaths) {
-                    val dir = if (relPath.isEmpty()) root else File(root, relPath.trimEnd('/'))
-                    val children = try {
-                        dir.listFiles()
-                    } catch (_: SecurityException) {
-                        null
-                    } ?: continue
-                    for (child in children) {
-                        if (child.isFile && child.length() > 0L && isImageFileName(child.name)) {
-                            val abs = child.absolutePath
-                            if (abs !in mediaStorePaths && seen.add(abs)) {
-                                val uri = Uri.fromFile(child)
-                                entries.add(
-                                    GalleryMediaEntry(
-                                        id = -(abs.hashCode().toLong() and 0x7FFFFFFFL) - 1L,
-                                        uri = uri,
-                                        dateTaken = child.lastModified(),
-                                        width = 0,
-                                        height = 0
-                                    )
-                                )
-                            }
+                    if (bucketId in mediaBucketIds || (relPath.isNotEmpty() && relPath in fsRelPaths)) {
+                        if (bucketId in mediaBucketIds && relPath.isNotEmpty()) {
+                            selectedRelPathsFromMediaBuckets.add(relPath)
                         }
+                        selectedEntries.add(entry)
                     }
                 }
             }
-            entries.sortWith(
-                compareByDescending<GalleryMediaEntry> { it.dateTaken }
-                    .thenByDescending { it.id }
-            )
         }
 
-        return entries
+        val targetRelPaths = (fsRelPaths + selectedRelPathsFromMediaBuckets)
+            .filter { isWhatsAppFolder(it) }
+            .toHashSet()
+
+        walkWhatsAppHiddenImageFiles(context, mediaStorePaths) { child, relPath ->
+            val abs = child.absolutePath
+            val entry = GalleryMediaEntry(
+                id = -(abs.hashCode().toLong() and 0x7FFFFFFFL) - 1L,
+                uri = Uri.fromFile(child),
+                dateTaken = child.lastModified(),
+                width = 0,
+                height = 0
+            )
+            allWhatsAppEntries.add(entry)
+            if (relPath in targetRelPaths) {
+                selectedEntries.add(entry)
+            }
+        }
+
+        val finalEntries = if (selectedEntries.isNotEmpty() || selectedBuckets.isEmpty()) {
+            if (selectedBuckets.isEmpty()) allWhatsAppEntries else selectedEntries
+        } else {
+            val hasAnySelectedWhatsAppId = fsRelPaths.isNotEmpty() || selectedRelPathsFromMediaBuckets.isNotEmpty()
+            if (hasAnySelectedWhatsAppId) selectedEntries else allWhatsAppEntries
+        }
+
+        finalEntries.sortWith(
+            compareByDescending<GalleryMediaEntry> { it.dateTaken }
+                .thenByDescending { it.id }
+        )
+
+        return finalEntries
     }
 
     fun mediaExists(context: Context, uri: Uri): Boolean {
