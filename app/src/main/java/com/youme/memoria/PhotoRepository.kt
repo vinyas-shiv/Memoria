@@ -34,35 +34,44 @@ data class SearchFilters(
     val confidence : Preset  = Preset.BALANCED
 )
 
+private class DecodedEmbeddingEntry(
+    val entity: PhotoEntity,
+    val vector: FloatArray
+)
+
 class PhotoRepository(private val appContext: Context) {
 
     private val dao = PhotosDatabase.getInstance(appContext).photoDao()
     private val memoriaEncoder = MemoriaEncoder(appContext)
 
+    private val embeddingCacheMutex = Mutex()
+    private val embeddingCacheByUri = LinkedHashMap<String, DecodedEmbeddingEntry>(4096)
+    @Volatile private var embeddingCacheDbCount: Int = -1
+
     suspend fun getCountPhotos() = dao.count()
 
     private val imageModelMutex = Mutex()
 
-
     suspend fun initializeImageModel() {
         imageModelMutex.withLock {
-            withContext(Dispatchers.IO){
+            withContext(Dispatchers.IO) {
                 memoriaEncoder.initializeImageEncoder()
             }
         }
-
     }
 
     private val initMutex = Mutex()
     @Volatile var initializeedTextModel = false
         private set
+
     suspend fun initializeTextModel() {
         if (initializeedTextModel) return
-        withContext(Dispatchers.IO){
+        withContext(Dispatchers.IO) {
             memoriaEncoder.initializeTextEncoder()
             initializeedTextModel = true
         }
     }
+
     suspend fun ensureTextModelInitialized() {
         if (initializeedTextModel) return
         initMutex.withLock {
@@ -71,42 +80,82 @@ class PhotoRepository(private val appContext: Context) {
             initializeedTextModel = true
         }
     }
+
     suspend fun getFoldersList(): List<FolderCount> = dao.getAvailableFolders()
 
     suspend fun getCameraList() = dao.getAvailableCameras()
 
-
     suspend fun alreadyExistsList() = dao.getAll()
 
-    suspend fun indexedImagesFiltered(searchFilters :SearchFilters ): List<PhotoEntity> {
+    private suspend fun ensureEmbeddingCacheLoaded(): Collection<DecodedEmbeddingEntry> =
+        withContext(Dispatchers.IO) {
+            val currentCount = dao.count()
+            if (embeddingCacheDbCount == currentCount && embeddingCacheByUri.isNotEmpty()) {
+                return@withContext embeddingCacheByUri.values
+            }
+            embeddingCacheMutex.withLock {
+                val recheckCount = dao.count()
+                if (embeddingCacheDbCount != recheckCount || (recheckCount > 0 && embeddingCacheByUri.isEmpty())) {
+                    val rows = dao.getAll()
+                    embeddingCacheByUri.clear()
+                    for (row in rows) {
+                        if (row.embedding.isNotEmpty()) {
+                            // Keep empty ByteArray on cached entity copy to halve heap footprint while preserving metadata
+                            val lightEntity = row.copy(embedding = NON_EMPTY_MARKER)
+                            embeddingCacheByUri[row.uri] = DecodedEmbeddingEntry(
+                                entity = lightEntity,
+                                vector = row.embedding.toFloatArray()
+                            )
+                        }
+                    }
+                    embeddingCacheDbCount = recheckCount
+                }
+                embeddingCacheByUri.values
+            }
+        }
+
+    suspend fun indexedImagesFiltered(searchFilters: SearchFilters): List<PhotoEntity> {
         val selectedBuckets = folderPrefs.selectedBuckets.first()
         if (selectedBuckets.isEmpty()) return emptyList()
         val allowedUris = withContext(Dispatchers.IO) {
             MediaScannerHelper.getImagesForSelectedBuckets(appContext, selectedBuckets)
                 .mapTo(HashSet()) { it.toString() }
         }
-        return dao.getFiltered(
-            searchFilters.startDate,
-            searchFilters.endDate,
-            searchFilters.folders,
-            searchFilters.camera,
-            foldersEmpty = searchFilters.folders.isEmpty()
-        ).filter { it.uri in allowedUris }
+        val cachedEntries = ensureEmbeddingCacheLoaded()
+        val folderFilterSet = if (searchFilters.folders.isEmpty()) null else searchFilters.folders.toHashSet()
+        val start = searchFilters.startDate
+        val end = searchFilters.endDate
+        val cam = searchFilters.camera
+
+        val out = ArrayList<PhotoEntity>(minOf(cachedEntries.size, allowedUris.size))
+        for (item in cachedEntries) {
+            val e = item.entity
+            if (e.uri !in allowedUris) continue
+            if (start != null && (e.dateTaken ?: 0L) < start) continue
+            if (end != null && (e.dateTaken ?: 0L) > end) continue
+            if (folderFilterSet != null && e.folderPath !in folderFilterSet) continue
+            if (cam != null && e.cameraModel != cam) continue
+            out.add(e)
+        }
+        return out
     }
 
     suspend fun markAsFailed(uri: String) {
         if (alreadyExists(uri)) return
-        dao.insert(PhotoEntity(
-            uri = uri,
-            embedding = ByteArray(0),
-            width = 0,
-            height = 0
-        ))
+        dao.insert(
+            PhotoEntity(
+                uri = uri,
+                embedding = ByteArray(0),
+                width = 0,
+                height = 0
+            )
+        )
+        embeddingCacheDbCount = -1
     }
 
-    suspend fun encodeImage(context : Context,image: Uri) : FloatArray {
-        return withContext(Dispatchers.IO){
-            val bitmap = uriToBitmap(context, image)
+    suspend fun encodeImage(context: Context, image: Uri): FloatArray {
+        return withContext(Dispatchers.IO) {
+            val (bitmap, _) = decodeBitmapAndDimensions(context, image)
             try {
                 memoriaEncoder.encodeImage(bitmap)
             } finally {
@@ -114,69 +163,90 @@ class PhotoRepository(private val appContext: Context) {
             }
         }
     }
-    suspend fun searchByEmbd(embedding: FloatArray,indexedImages : List<PhotoEntity>,confidence: Float) : List<Pair<PhotoEntity,Float>>{
-        return withContext(Dispatchers.IO){
-            val allPhotos = indexedImages
 
-            allPhotos.filter { it.embedding.isNotEmpty() }.map { photo->
-                val score  = memoriaEncoder.cosineSimilarity(embedding,photo.embedding.toFloatArray())
-                photo to score
-            }.sortedByDescending { it.second }.filter { it.second>=confidence }
+    suspend fun encodeImageWithDimensions(
+        context: Context,
+        image: Uri
+    ): Pair<FloatArray, Pair<Int, Int>> = withContext(Dispatchers.IO) {
+        val (bitmap, dims) = decodeBitmapAndDimensions(context, image)
+        try {
+            memoriaEncoder.encodeImage(bitmap) to dims
+        } finally {
+            bitmap.recycle()
         }
     }
 
-    suspend fun encodeAndSaveImage(context : Context,uri: Uri){
-        withContext(Dispatchers.IO){
+    suspend fun searchByEmbd(
+        embedding: FloatArray,
+        indexedImages: List<PhotoEntity>,
+        confidence: Float
+    ): List<Pair<PhotoEntity, Float>> {
+        return withContext(Dispatchers.Default) {
+            ensureEmbeddingCacheLoaded()
+            indexedImages.mapNotNull { photo ->
+                val vec = embeddingCacheByUri[photo.uri]?.vector
+                    ?: photo.embedding.takeIf { it.size >= 4 }?.toFloatArray()
+                    ?: return@mapNotNull null
+                val score = memoriaEncoder.cosineSimilarity(embedding, vec)
+                if (score >= confidence) (photo to score) else null
+            }.sortedByDescending { it.second }
+        }
+    }
+
+    suspend fun encodeAndSaveImage(context: Context, uri: Uri) {
+        withContext(Dispatchers.IO) {
             initializeImageModel()
-            val bitmap = uriToBitmap(context, uri)
-            try {
-                val encodedImage= memoriaEncoder.encodeImage(bitmap)
-                val sizeData = ImageSizeUtil.getImageDimensions(context,uri)
-                val photoMetaData = ImageSizeUtil.getPhotoMetadata(context,uri)
-                val cameraInfo = ImageSizeUtil.getCameraInfo(context,uri)
-                saveEmbedding(
-                    uri.toString(),
-                    encodedImage,
-                    sizeData?.second?:0,
-                    sizeData?.first?:0,
-                    photoMetaData?.first,
-                    photoMetaData?.second,
-                    cameraInfo.first,
-                    cameraInfo.second,
-
-                    )
-            } finally {
-                bitmap.recycle()
-            }
+            val (encodedImage, sizeData) = encodeImageWithDimensions(context, uri)
+            val (dateTaken, folderPath, cameraInfo) = ImageSizeUtil.getCombinedMetadata(context, uri)
+            insertEmbeddingFast(
+                uri = uri.toString(),
+                embedding = encodedImage,
+                height = sizeData.second,
+                width = sizeData.first,
+                dateTaken = dateTaken,
+                folderPath = folderPath,
+                cameraMake = cameraInfo.first,
+                cameraModel = cameraInfo.second
+            )
         }
     }
 
-    suspend fun search(query: String, indexedImages : List<PhotoEntity>, confidence: Float) : List<Pair<PhotoEntity,Float>>{
-        return withContext(Dispatchers.Default){
+    suspend fun search(
+        query: String,
+        indexedImages: List<PhotoEntity>,
+        confidence: Float
+    ): List<Pair<PhotoEntity, Float>> {
+        return withContext(Dispatchers.Default) {
+            if (indexedImages.isEmpty()) return@withContext emptyList()
+            ensureEmbeddingCacheLoaded()
             val encodedText = memoriaEncoder.encodeText(query)
 
-            val candidates = indexedImages.filter { it.embedding.isNotEmpty() }
-            if (candidates.isEmpty()) return@withContext emptyList()
-
-
             val cores = Runtime.getRuntime().availableProcessors()
-            val chunkCount = cores.coerceAtMost(candidates.size).coerceAtLeast(1)
-            val chunkSize = (candidates.size+chunkCount-1)/chunkCount
-            val chunks = candidates.chunked(chunkSize)
+            val chunkCount = cores.coerceAtMost(indexedImages.size).coerceAtLeast(1)
+            val chunkSize = (indexedImages.size + chunkCount - 1) / chunkCount
+            val chunks = indexedImages.chunked(chunkSize)
 
             val partialResults: List<List<Pair<PhotoEntity, Float>>> = chunks.map { chunk ->
                 async {
-                    chunk.map { photo ->
-                        photo to memoriaEncoder.cosineSimilarity(encodedText, photo.embedding.toFloatArray())
+                    val matches = ArrayList<Pair<PhotoEntity, Float>>()
+                    for (photo in chunk) {
+                        val vec = embeddingCacheByUri[photo.uri]?.vector
+                            ?: photo.embedding.takeIf { it.size >= 4 }?.toFloatArray()
+                            ?: continue
+                        val score = memoriaEncoder.cosineSimilarity(encodedText, vec)
+                        if (score >= confidence) {
+                            matches.add(photo to score)
+                        }
                     }
-                        .filter { it.second >= confidence }
-                        .sortedByDescending { it.second }
+                    matches.sortByDescending { it.second }
+                    matches
                 }
             }.awaitAll()
 
             mergeSortedDescending(partialResults)
         }
     }
+
     private fun mergeSortedDescending(
         lists: List<List<Pair<PhotoEntity, Float>>>
     ): List<Pair<PhotoEntity, Float>> {
@@ -205,50 +275,98 @@ class PhotoRepository(private val appContext: Context) {
         }
         return result
     }
+
     suspend fun pruneDeletedPhotos(currentUris: List<Uri>) {
         val currentUriStrings = currentUris.map { it.toString() }
         currentUriStrings.chunked(500).forEach { batch ->
             dao.deleteWhereUriNotIn(batch)
         }
+        embeddingCacheMutex.withLock {
+            currentUriStrings.forEach { embeddingCacheByUri.remove(it) }
+            embeddingCacheDbCount = -1
+        }
     }
-    suspend fun searchByImage(context : Context,image: Uri,indexedImages : List<PhotoEntity>) : List<Pair<PhotoEntity,Float>>{
-        return withContext(Dispatchers.IO){
+
+    suspend fun searchByImage(
+        context: Context,
+        image: Uri,
+        indexedImages: List<PhotoEntity>
+    ): List<Pair<PhotoEntity, Float>> {
+        return withContext(Dispatchers.IO) {
+            if (indexedImages.isEmpty()) return@withContext emptyList()
+            ensureEmbeddingCacheLoaded()
             memoriaEncoder.initializeImageEncoder()
-            val bitmap = uriToBitmap(context, image)
+            val (bitmap, _) = decodeBitmapAndDimensions(context, image)
             val encodedImage = try {
                 memoriaEncoder.encodeImage(bitmap)
             } finally {
                 bitmap.recycle()
             }
-            val allPhotos = indexedImages
-            allPhotos.filter { it.embedding.isNotEmpty() }.map { photo->
-                val score  = memoriaEncoder.cosineSimilarity(encodedImage,photo.embedding.toFloatArray())
-                photo to score
+            indexedImages.mapNotNull { photo ->
+                val vec = embeddingCacheByUri[photo.uri]?.vector
+                    ?: photo.embedding.takeIf { it.size >= 4 }?.toFloatArray()
+                    ?: return@mapNotNull null
+                photo to memoriaEncoder.cosineSimilarity(encodedImage, vec)
             }.sortedByDescending { it.second }
         }
     }
 
-    suspend fun saveEmbedding(uri: String, embedding: FloatArray,height: Int,width : Int,
-                              dateTaken: Long?,
-                              folderPath: String?,
-                              cameraMake: String?,
-                              cameraModel: String?) {
-        if (alreadyExists(uri)) return
-        dao.insert(PhotoEntity(
-            uri = uri, embedding = embedding.toByteArray(),
-            width = width, height = height,
-            dateTaken = dateTaken, folderPath = folderPath,
-            cameraMake = cameraMake, cameraModel = cameraModel
-        ))
+    suspend fun insertEmbeddingFast(
+        uri: String,
+        embedding: FloatArray,
+        height: Int,
+        width: Int,
+        dateTaken: Long?,
+        folderPath: String?,
+        cameraMake: String?,
+        cameraModel: String?
+    ) {
+        val entity = PhotoEntity(
+            uri = uri,
+            embedding = embedding.toByteArray(),
+            width = width,
+            height = height,
+            dateTaken = dateTaken,
+            folderPath = folderPath,
+            cameraMake = cameraMake,
+            cameraModel = cameraModel
+        )
+        dao.insert(entity)
+        embeddingCacheMutex.withLock {
+            if (embeddingCacheDbCount >= 0 && uri !in embeddingCacheByUri) {
+                embeddingCacheByUri[uri] = DecodedEmbeddingEntry(
+                    entity = entity.copy(embedding = NON_EMPTY_MARKER),
+                    vector = embedding
+                )
+                embeddingCacheDbCount++
+            } else {
+                embeddingCacheDbCount = -1
+            }
+        }
     }
-    suspend fun alreadyExists(uri: String): Boolean = dao.existsByUri(uri)!=null
 
-    suspend fun unloadModel() = imageModelMutex.withLock {memoriaEncoder.close()}
+    suspend fun saveEmbedding(
+        uri: String,
+        embedding: FloatArray,
+        height: Int,
+        width: Int,
+        dateTaken: Long?,
+        folderPath: String?,
+        cameraMake: String?,
+        cameraModel: String?
+    ) {
+        if (alreadyExists(uri)) return
+        insertEmbeddingFast(uri, embedding, height, width, dateTaken, folderPath, cameraMake, cameraModel)
+    }
+
+    suspend fun alreadyExists(uri: String): Boolean = dao.existsByUri(uri) != null
+
+    suspend fun unloadModel() = imageModelMutex.withLock { memoriaEncoder.close() }
     fun unloadImageModel() = memoriaEncoder.freeImageEncoder()
 
     val folderPrefs = FolderPrefs(appContext)
 
-    suspend fun getImagesToIndex(context: Context) : List<Uri> = withContext(Dispatchers.IO) {
+    suspend fun getImagesToIndex(context: Context): List<Uri> = withContext(Dispatchers.IO) {
         val selectedBuckets = folderPrefs.selectedBuckets.first()
         MediaScannerHelper.getImagesForSelectedBuckets(context, selectedBuckets)
     }
@@ -283,22 +401,40 @@ class PhotoRepository(private val appContext: Context) {
             null
         )?.use { it.count } ?: -1
     }
-    fun uriToBitmap(context: Context, uri: Uri): Bitmap {
+
+    private fun decodeBitmapAndDimensions(
+        context: Context,
+        uri: Uri
+    ): Pair<Bitmap, Pair<Int, Int>> {
         val source = if (uri.scheme == "file" && !uri.path.isNullOrEmpty()) {
             ImageDecoder.createSource(File(uri.path!!))
         } else {
             ImageDecoder.createSource(context.contentResolver, uri)
         }
-        return ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+        var origW = 0
+        var origH = 0
+        val bitmap = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+            origW = info.size.width
+            origH = info.size.height
             decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-            val maxDim = maxOf(info.size.width, info.size.height)
+            val maxDim = maxOf(origW, origH)
             if (maxDim > 1024) {
                 val scale = 1024f / maxDim
                 decoder.setTargetSize(
-                    (info.size.width * scale).toInt(),
-                    (info.size.height * scale).toInt()
+                    (origW * scale).toInt().coerceAtLeast(1),
+                    (origH * scale).toInt().coerceAtLeast(1)
                 )
             }
         }
+        ImageSizeUtil.cacheDimensions(uri, origW, origH)
+        return bitmap to (origW to origH)
+    }
+
+    fun uriToBitmap(context: Context, uri: Uri): Bitmap {
+        return decodeBitmapAndDimensions(context, uri).first
+    }
+
+    companion object {
+        private val NON_EMPTY_MARKER = byteArrayOf(1)
     }
 }
