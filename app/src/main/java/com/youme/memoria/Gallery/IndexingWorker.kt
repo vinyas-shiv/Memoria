@@ -7,6 +7,7 @@ import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.BatteryManager
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.net.toUri
@@ -17,13 +18,14 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.youme.memoria.ImageSizeUtil
 import com.youme.memoria.MainActivity
+import com.youme.memoria.MediaScannerHelper
 import com.youme.memoria.MemoriaApp
 import com.youme.memoria.R
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
-import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Duration.Companion.milliseconds
 
 class IndexingWorker(
@@ -38,74 +40,72 @@ class IndexingWorker(
     override suspend fun doWork(): Result {
         setForeground(foregroundInfo(0, 0))
         try {
+            MediaScannerHelper.invalidateCache()
             val existing: HashSet<String> =
                 repo.alreadyExistsList().mapTo(HashSet()) { it.uri }
             val all = repo.getImagesToIndex(context).map { it.toString() }
             val toProcess = all.filter { it !in existing }.map { it.toUri() }
             var done = existing.count { it in all }
 
-
             setProgress(workDataOf(KEY_DONE to done, KEY_TOTAL to all.size, KEY_ETA to 0L))
 
-
             var prvEtaMs = 0L
+            var lastUiUpdateMs = SystemClock.elapsedRealtime()
             repo.initializeImageModel()
             var avgMsPerImage = 0f
+
             toProcess.forEachIndexed { index, uri ->
                 if (isStopped) return Result.success()
                 coroutineContext.ensureActive()
                 val startTime = System.currentTimeMillis()
 
                 try {
-                    val encodedImage =
-                        repo.encodeImage(context, uri)
-                    val sizeData = ImageSizeUtil.getImageDimensions(context,uri)
-                    val photoMetaData = ImageSizeUtil.getPhotoMetadata(context,uri)
-                    val cameraInfo = ImageSizeUtil.getCameraInfo(context,uri)
-                    repo.saveEmbedding(
-                        uri.toString(),
-                        encodedImage,
-                        sizeData?.second?:0,
-                        sizeData?.first?:0,
-                        photoMetaData?.first,
-                        photoMetaData?.second,
-                        cameraInfo.first,
-                        cameraInfo.second
-
+                    val (encodedImage, sizeData) = repo.encodeImageWithDimensions(context, uri)
+                    val (dateTaken, folderPath, cameraInfo) =
+                        ImageSizeUtil.getCombinedMetadata(context, uri)
+                    repo.insertEmbeddingFast(
+                        uri = uri.toString(),
+                        embedding = encodedImage,
+                        height = sizeData.second,
+                        width = sizeData.first,
+                        dateTaken = dateTaken,
+                        folderPath = folderPath,
+                        cameraMake = cameraInfo.first,
+                        cameraModel = cameraInfo.second
                     )
                     val took = (System.currentTimeMillis() - startTime).toFloat()
                     avgMsPerImage = if (avgMsPerImage == 0f) took else avgMsPerImage * 0.95f + took * 0.05f
 
-
                     done++
                     existing.add(uri.toString())
 
-                    //update ui
-                    setProgress(workDataOf(KEY_DONE to done, KEY_TOTAL to all.size, KEY_ETA to prvEtaMs))
-                    setForeground(foregroundInfo(done, all.size))
-
-
+                    val nowElapsed = SystemClock.elapsedRealtime()
+                    if (nowElapsed - lastUiUpdateMs >= UI_UPDATE_INTERVAL_MS || index == toProcess.lastIndex) {
+                        lastUiUpdateMs = nowElapsed
+                        prvEtaMs = (avgMsPerImage * (toProcess.size - index - 1)).toLong()
+                        setProgress(workDataOf(KEY_DONE to done, KEY_TOTAL to all.size, KEY_ETA to prvEtaMs))
+                        setForeground(foregroundInfo(done, all.size))
+                    }
                 } catch (e: CancellationException) {
                     throw e
-
                 } catch (e: Throwable) {
                     Log.e("ImageEncoding", "Failed: $uri", e)
                     repo.markAsFailed(uri.toString())
                 }
 
                 if (index % 10 == 0 || index == toProcess.lastIndex) {
-
                     val etaMs = (avgMsPerImage * (toProcess.size - index - 1)).toLong()
                     prvEtaMs = etaMs
-
                     throttleIfHot()
                 }
             }
             return Result.success(workDataOf(KEY_DONE to done))
         } finally {
-            withContext(NonCancellable) { repo.unloadModel() }
+            // Release only the image encoder after indexing so the shared text encoder stays warm for search
+            withContext(NonCancellable) { repo.unloadImageModel() }
         }
     }
+
     private fun openAppIntent(): PendingIntent {
         val intent = Intent(applicationContext, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -117,6 +117,7 @@ class IndexingWorker(
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
     }
+
     fun getThermalStatus(tempCelsius: Float): ThermalStatus {
         return when {
             tempCelsius < 35f -> ThermalStatus.GREEN
@@ -124,13 +125,12 @@ class IndexingWorker(
             else -> ThermalStatus.RED
         }
     }
+
     fun getBatteryTemperature(): Float {
         val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
         val batteryStatus = context.registerReceiver(null, intentFilter)
-
         val tempTenths = batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
-
-        return  tempTenths / 10.0f
+        return tempTenths / 10.0f
     }
 
     private suspend fun throttleIfHot() {
@@ -151,7 +151,7 @@ class IndexingWorker(
             .setProgress(total, done, total == 0)
             .setOngoing(true)
             .setContentIntent(openAppIntent())
-            .addAction(R.drawable.baseline_pause_24,"Pause",pauseIntent)
+            .addAction(R.drawable.baseline_pause_24, "Pause", pauseIntent)
             .setOnlyAlertOnce(true)
             .build()
         return if (Build.VERSION.SDK_INT >= 29)
@@ -160,8 +160,12 @@ class IndexingWorker(
     }
 
     companion object {
-        const val KEY_DONE = "done"; const val KEY_TOTAL = "total"; const val KEY_ETA = "eta"
-        const val CHANNEL_ID = "indexing"; const val NOTIF_ID = 42
+        const val KEY_DONE = "done"
+        const val KEY_TOTAL = "total"
+        const val KEY_ETA = "eta"
+        const val CHANNEL_ID = "indexing"
+        const val NOTIF_ID = 42
         const val UNIQUE_NAME = "photo_indexing"
+        private const val UI_UPDATE_INTERVAL_MS = 400L
     }
 }
