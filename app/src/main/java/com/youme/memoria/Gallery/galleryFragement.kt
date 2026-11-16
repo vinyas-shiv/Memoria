@@ -1,6 +1,5 @@
 package com.youme.memoria.Gallery
 
-
 import android.Manifest
 import android.content.ContentUris
 import android.content.Intent
@@ -11,7 +10,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
-import android.util.Log
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
@@ -24,15 +22,12 @@ import androidx.fragment.app.activityViewModels
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
-import androidx.paging.PagingData
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import androidx.recyclerview.widget.StaggeredGridLayoutManager
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.progressindicator.LinearProgressIndicator
-import com.youme.memoria.ImageLoading.ImagePagingAdapter
 import com.youme.memoria.PhotoRepository
 import com.youme.memoria.R
 import com.youme.memoria.imageViewer.imageViewerActivity
@@ -42,13 +37,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
-class GalleryFragement  : Fragment(R.layout.gallery_layout){
+class GalleryFragement : Fragment(R.layout.gallery_layout) {
 
     private lateinit var Adapter: GalleryDateAdapter
 
     private lateinit var repo: PhotoRepository
     private lateinit var observer: GalleryObserver
-    private  var imageEncodingJob: Job?=null
+    private var imageEncodingJob: Job? = null
     private val imglist = mutableListOf<Uri>()
 
     private val indexingViewModel: IndexingViewModel by activityViewModels {
@@ -57,28 +52,28 @@ class GalleryFragement  : Fragment(R.layout.gallery_layout){
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             indexingViewModel.startIndexing()
-            if (!granted) Toast.makeText(requireContext(),"started indexing without notification", Toast.LENGTH_SHORT).show()
+            if (!granted) Toast.makeText(requireContext(), "started indexing without notification", Toast.LENGTH_SHORT).show()
         }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
-
         super.onViewCreated(view, savedInstanceState)
         repo = PhotoRepository(requireContext())
 
-        Adapter = GalleryDateAdapter(){uri->
+        Adapter = GalleryDateAdapter { uri ->
             viewLifecycleOwner.lifecycleScope.launch {
-                val pos = repo.getImagePosition(requireContext().contentResolver,uri)
+                val pos = repo.getImagePosition(requireContext(), uri)
+                val imageId = if (uri.scheme == "content") {
+                    runCatching { ContentUris.parseId(uri) }.getOrDefault(-1L)
+                } else -1L
                 val intent = Intent(requireContext(), imageViewerActivity::class.java)
-                intent.putExtra("pos",pos)
-                intent.putExtra("imageId", ContentUris.parseId(uri))
-                startActivity(intent,)
+                intent.putExtra("pos", pos)
+                intent.putExtra("imageId", imageId)
+                startActivity(intent)
             }
-
         }
 
-
         val recyclerView = view.findViewById<RecyclerView>(R.id.rec)
-        val layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.VERTICAL,false)
+        val layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.VERTICAL, false)
 
         recyclerView.apply {
             this.layoutManager = layoutManager
@@ -86,7 +81,6 @@ class GalleryFragement  : Fragment(R.layout.gallery_layout){
         }
 
         observer = GalleryObserver(Handler(Looper.getMainLooper()))
-
 
         requireContext().contentResolver.registerContentObserver(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
@@ -96,27 +90,29 @@ class GalleryFragement  : Fragment(R.layout.gallery_layout){
 
         loadGallery()
         indexingState()
-
-
-
         navigateToSearch()
-
-
-
     }
+
     private fun loadGallery() {
-        val viewModel = GalleryViewModel(GalleryRepository(requireContext().contentResolver))
+        val viewModel = GalleryViewModel(
+            GalleryRepository(requireContext().contentResolver, requireContext().applicationContext)
+        )
         viewLifecycleOwner.lifecycleScope.launch {
-            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED){
-                viewModel.galleryFlow.collectLatest { pagingData ->
-                    Adapter.submitData(pagingData)
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                launch {
+                    viewModel.galleryFlow.collectLatest { pagingData ->
+                        Adapter.submitData(pagingData)
+                    }
                 }
-
-
+                launch {
+                    indexingViewModel.folderPrefs.selectedBuckets.collectLatest {
+                        Adapter.refresh()
+                    }
+                }
             }
-
         }
     }
+
     private fun requestNotificationPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val granted = ContextCompat.checkSelfPermission(
@@ -124,55 +120,46 @@ class GalleryFragement  : Fragment(R.layout.gallery_layout){
             ) == PackageManager.PERMISSION_GRANTED
             if (!granted) {
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }else indexingViewModel.startIndexing()
-        }
-        else{
+            } else indexingViewModel.startIndexing()
+        } else {
             indexingViewModel.startIndexing()
         }
     }
 
-    private fun indexingState(){
+    private fun indexingState() {
         val toolbar = requireView().findViewById<MaterialToolbar>(R.id.toolbar)
 
         val largeIndicatorBox = requireView().findViewById<MaterialCardView>(R.id.big_indicator)
         val logText = requireView().findViewById<TextView>(R.id.textView2)
         val processButton = requireView().findViewById<MaterialButton>(R.id.button)
-        val progressbar  = requireView().findViewById<LinearProgressIndicator>(R.id.progressbar)
+        val progressbar = requireView().findViewById<LinearProgressIndicator>(R.id.progressbar)
 
         val smallIndicatorBox = requireView().findViewById<MaterialCardView>(R.id.small_indicator)
         val smallIndicatorText = requireView().findViewById<TextView>(R.id.textView12)
         val smallIndicatorProgress = requireView().findViewById<LinearProgressIndicator>(R.id.prog2)
 
-        val collapseButton  = requireView().findViewById<Button>(R.id.button5)
+        val collapseButton = requireView().findViewById<Button>(R.id.button5)
 
         collapseButton.setOnClickListener {
-            animateIndicator(largeIndicatorBox,smallIndicatorBox)
-            toolbar.title=""
-
+            animateIndicator(largeIndicatorBox, smallIndicatorBox)
+            toolbar.title = ""
         }
         smallIndicatorBox.setOnClickListener {
-            animateIndicator(smallIndicatorBox,largeIndicatorBox,toolbar)
+            animateIndicator(smallIndicatorBox, largeIndicatorBox, toolbar)
         }
-
-
-
-
-
-
 
         viewLifecycleOwner.lifecycleScope.launch {
             launch {
-                SettingsPrefs.getIndicatorStatus(requireContext()).collectLatest { status->
-                    largeIndicatorBox.isVisible=!status
-                    smallIndicatorBox.isVisible=status
-                    toolbar.title= if (status) "" else "Memoria"
+                SettingsPrefs.getIndicatorStatus(requireContext()).collectLatest { status ->
+                    largeIndicatorBox.isVisible = !status
+                    smallIndicatorBox.isVisible = status
+                    toolbar.title = if (status) "" else "Memoria"
                 }
             }
 
-
-            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED){
-                indexingViewModel.state.collectLatest {state->
-                    when(state){
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                indexingViewModel.state.collectLatest { state ->
+                    when (state) {
                         is IndexingViewModel.IndexingState.Ready -> {
                             processButton.setIconResource(R.drawable.baseline_play_arrow_24)
                             logText.text = "Indexed : ${state.processed}/${state.total}"
@@ -180,63 +167,58 @@ class GalleryFragement  : Fragment(R.layout.gallery_layout){
                             smallIndicatorText.text = "Paused"
 
                             progressbar.apply {
-                                isIndeterminate=false
+                                isIndeterminate = false
                                 max = state.total
-                                progress  =state.processed
+                                progress = state.processed
                             }
                             smallIndicatorProgress.apply {
                                 max = state.total
-                                progress  =state.processed
+                                progress = state.processed
                             }
 
-                            processButton.isVisible=true
+                            processButton.isVisible = true
                             processButton.setOnClickListener {
-                                //before starting request notfications permissions
                                 requestNotificationPermissionIfNeeded()
-                                logText.text="Loading"
-                                progressbar.isIndeterminate=true
+                                logText.text = "Loading"
+                                progressbar.isIndeterminate = true
                             }
-
                         }
-                        is IndexingViewModel.IndexingState.Running ->{
+                        is IndexingViewModel.IndexingState.Running -> {
                             logText.text = "Indexing: ${state.processed}/${state.total}"
                             smallIndicatorText.text = "${state.processed}/${state.total}"
 
                             processButton.setIconResource(R.drawable.baseline_pause_24)
-                            processButton.isVisible=true
+                            processButton.isVisible = true
                             processButton.setOnClickListener {
                                 indexingViewModel.pause()
                                 logText.text = "Indexed : ${state.processed}/${state.total}"
                             }
 
-                            progressbar.isVisible=true
-                            progressbar.isIndeterminate=false
-
+                            progressbar.isVisible = true
+                            progressbar.isIndeterminate = false
 
                             progressbar.apply {
-                                max =  state.total
+                                max = state.total
                                 progress = state.processed
                             }
                             smallIndicatorProgress.apply {
                                 max = state.total
-                                progress  =state.processed
+                                progress = state.processed
                             }
                         }
-                        is IndexingViewModel.IndexingState.Completed ->{
-                            processButton.isVisible=false
+                        is IndexingViewModel.IndexingState.Completed -> {
+                            processButton.isVisible = false
                             logText.text = "Indexing completed: ${state.total}"
-                            progressbar.isIndeterminate=false
-
+                            progressbar.isIndeterminate = false
 
                             progressbar.apply {
-                                max =  state.total
+                                max = state.total
                                 progress = state.total
                             }
                             smallIndicatorProgress.apply {
                                 max = state.total
-                                progress  =state.total
+                                progress = state.total
                             }
-
 
                             smallIndicatorText.text = "Completed"
                         }
@@ -244,40 +226,35 @@ class GalleryFragement  : Fragment(R.layout.gallery_layout){
                     }
                 }
             }
-
         }
-
-
     }
-    private fun animateIndicator(visibleView : View,hiddenView : View,toolbar: MaterialToolbar?=null){
+
+    private fun animateIndicator(visibleView: View, hiddenView: View, toolbar: MaterialToolbar? = null) {
         visibleView.animate().scaleX(0f).scaleY(0f).setDuration(200).withEndAction {
-            visibleView.isVisible=false
+            visibleView.isVisible = false
             hiddenView.apply {
-                isVisible=true
-                scaleX=0f
-                scaleY=0f
+                isVisible = true
+                scaleX = 0f
+                scaleY = 0f
             }
             toolbar?.apply {
-                title="Memoria"
+                title = "Memoria"
             }
             hiddenView.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
         }.start()
     }
 
-    private fun navigateToSearch(){
+    private fun navigateToSearch() {
         val toolbar = requireView().findViewById<MaterialToolbar>(R.id.toolbar)
         toolbar.setOnMenuItemClickListener { item ->
-            when(item.itemId){
-                R.id.search->{
+            when (item.itemId) {
+                R.id.search -> {
                     indexingViewModel.pause()
                     val intent = Intent(requireContext(), searchActivity::class.java)
                     startActivity(intent)
                 }
             }
             true
-
         }
     }
-
-
 }
