@@ -7,11 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.ImageDecoder
 import android.net.Uri
 import android.provider.MediaStore
-import android.util.Log
-import androidx.core.net.toUri
-import androidx.room.Query
 import com.youme.memoria.Encoder.MemoriaEncoder
-import com.youme.memoria.ImageLoading.ImageUriItem
 import com.youme.memoria.roomCach.FolderCount
 import com.youme.memoria.roomCach.PhotoEntity
 import com.youme.memoria.roomCach.PhotosDatabase
@@ -25,6 +21,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.File
 
 enum class Preset(val score: Float) {
     LOOSE(0.14f), BALANCED(0.18f), STRICT(0.22f)
@@ -81,7 +78,7 @@ class PhotoRepository(context: Context) {
 
     suspend fun alreadyExistsList() = dao.getAll()
 
-    suspend fun indexedImagesFiltered(searchFilters :SearchFilters ) =  dao.getFiltered(
+    suspend fun indexedImagesFiltered(searchFilters :SearchFilters ) = dao.getFiltered(
         searchFilters.startDate,
         searchFilters.endDate,
         searchFilters.folders,
@@ -138,7 +135,7 @@ class PhotoRepository(context: Context) {
                     cameraInfo.first,
                     cameraInfo.second,
 
-                )
+                    )
             } finally {
                 bitmap.recycle()
             }
@@ -206,9 +203,13 @@ class PhotoRepository(context: Context) {
     suspend fun searchByImage(context : Context,image: Uri,indexedImages : List<PhotoEntity>) : List<Pair<PhotoEntity,Float>>{
         return withContext(Dispatchers.IO){
             memoriaEncoder.initializeImageEncoder()
-            val encodedImage= memoriaEncoder.encodeImage(uriToBitmap(context,image))
+            val bitmap = uriToBitmap(context, image)
+            val encodedImage = try {
+                memoriaEncoder.encodeImage(bitmap)
+            } finally {
+                bitmap.recycle()
+            }
             val allPhotos = indexedImages
-
             allPhotos.filter { it.embedding.isNotEmpty() }.map { photo->
                 val score  = memoriaEncoder.cosineSimilarity(encodedImage,photo.embedding.toFloatArray())
                 photo to score
@@ -236,69 +237,40 @@ class PhotoRepository(context: Context) {
 
     val folderPrefs = FolderPrefs(context)
 
-    suspend fun getImagesToIndex(context: Context) : List<Uri> {
-
-        val imglist = mutableListOf<Uri>()
+    suspend fun getImagesToIndex(context: Context) : List<Uri> = withContext(Dispatchers.IO) {
         val selectedBuckets = folderPrefs.selectedBuckets.first()
-
-        val projection = arrayOf(
-            MediaStore.Images.Media._ID,
-            MediaStore.Images.Media.DISPLAY_NAME,
-            MediaStore.Images.Media.DATE_ADDED
-        )
-
-        val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
-
-        var selection: String? = null
-        var selectionArgs: Array<String>? = null
-
-        if (selectedBuckets.isNotEmpty()) {
-            val placeholders = selectedBuckets.joinToString(",") { "?" }
-            selection = "${MediaStore.Images.Media.BUCKET_ID} IN ($placeholders)"
-            selectionArgs = selectedBuckets.toTypedArray()
-        }
-
-        context.contentResolver.query(
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            projection,
-            selection,
-            selectionArgs,
-            sortOrder
-        )?.use { cursor ->
-
-            val idCol =
-                cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-
-            val nameCol =
-                cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
-
-            while (cursor.moveToNext()) {
-
-                val id = cursor.getLong(idCol)
-                val name = cursor.getString(nameCol)
-
-                val uri = ContentUris.withAppendedId(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    id
-                )
-                imglist.add(uri)
-            }
-        }
-        return imglist
+        MediaScannerHelper.getImagesForSelectedBuckets(context, selectedBuckets)
     }
+
+    suspend fun getImagePosition(
+        context: Context,
+        image: Uri
+    ): Int = withContext(Dispatchers.IO) {
+        val selectedBuckets = folderPrefs.selectedBuckets.first()
+        val hasFsBuckets = selectedBuckets.any { it.startsWith(MediaScannerHelper.FS_BUCKET_PREFIX) }
+        if (hasFsBuckets || image.scheme == "file") {
+            val entries = MediaScannerHelper.getUnifiedGalleryEntries(context, selectedBuckets)
+            entries.indexOfFirst { it.uri == image }.coerceAtLeast(0)
+        } else {
+            getImagePosition(context.contentResolver, image)
+        }
+    }
+
     suspend fun getImagePosition(
         contentResolver: ContentResolver,
         image: Uri
     ): Int = withContext(Dispatchers.IO) {
+        if (image.scheme == "file") return@withContext 0
         val uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        val imageId = ContentUris.parseId(image)
+        val imageId = runCatching { ContentUris.parseId(image) }.getOrElse { return@withContext 0 }
         val dateTaken = contentResolver.query(
             uri, arrayOf(MediaStore.Images.Media.DATE_TAKEN),
             "${MediaStore.Images.Media._ID} = ?", arrayOf(imageId.toString()), null
         )?.use { if (it.moveToFirst()) it.getLong(0) else null } ?: return@withContext -1
 
         contentResolver.query(
-            uri, arrayOf(MediaStore.Images.Media._ID),
+            uri,
+            arrayOf(MediaStore.Images.Media._ID),
             "${MediaStore.Images.Media.DATE_TAKEN} > ? OR " +
                     "(${MediaStore.Images.Media.DATE_TAKEN} = ? AND ${MediaStore.Images.Media._ID} > ?)",
             arrayOf(dateTaken.toString(), dateTaken.toString(), imageId.toString()),
@@ -306,7 +278,11 @@ class PhotoRepository(context: Context) {
         )?.use { it.count } ?: -1
     }
     fun uriToBitmap(context: Context, uri: Uri): Bitmap {
-        val source = ImageDecoder.createSource(context.contentResolver, uri)
+        val source = if (uri.scheme == "file" && !uri.path.isNullOrEmpty()) {
+            ImageDecoder.createSource(File(uri.path!!))
+        } else {
+            ImageDecoder.createSource(context.contentResolver, uri)
+        }
         return ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
             decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
             val maxDim = maxOf(info.size.width, info.size.height)
