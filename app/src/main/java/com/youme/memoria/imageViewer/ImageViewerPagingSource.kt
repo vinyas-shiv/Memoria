@@ -1,11 +1,7 @@
 package com.youme.memoria.imageViewer
 
 import android.content.ContentResolver
-import android.content.ContentUris
 import android.content.Context
-import android.os.Build
-import android.os.Bundle
-import android.provider.MediaStore
 import androidx.paging.PagingSource
 import androidx.paging.PagingState
 import com.youme.memoria.ImageLoading.ImageUriItem
@@ -28,6 +24,15 @@ class ImageViewerPagingSource(
     override suspend fun load(params: LoadParams<Int>): LoadResult<Int, ImageUriItem> =
         withContext(Dispatchers.IO) {
             try {
+                if (totalCount <= 0) {
+                    return@withContext LoadResult.Page(
+                        data = emptyList(),
+                        prevKey = null,
+                        nextKey = null,
+                        itemsBefore = 0,
+                        itemsAfter = 0
+                    )
+                }
                 val offset = (params.key ?: 0).coerceIn(0, maxOf(totalCount - 1, 0))
                 val limit = if (params is LoadParams.Prepend)
                     minOf(params.loadSize, offset) else params.loadSize
@@ -47,62 +52,19 @@ class ImageViewerPagingSource(
         }
 
     private suspend fun query(offset: Int, limit: Int): List<ImageUriItem> {
-        val ctx = appContext
-        if (ctx != null) {
-            val selectedBuckets = FolderPrefs(ctx).selectedBuckets.first()
-            val allEntries = MediaScannerHelper.getUnifiedGalleryEntries(ctx, selectedBuckets)
-            if (offset >= allEntries.size || limit <= 0) return emptyList()
-            val slice = allEntries.subList(offset, minOf(offset + limit, allEntries.size))
-            return slice.map { entry ->
-                val (w, h) = if (entry.width > 0 && entry.height > 0) {
-                    entry.width to entry.height
-                } else {
-                    ImageSizeUtil.getImageDimensions(ctx, entry.uri) ?: (1 to 1)
-                }
-                ImageUriItem(entry.id, entry.uri, w, h)
+        val ctx = appContext ?: return emptyList()
+        val selectedBuckets = FolderPrefs(ctx).selectedBuckets.first()
+        if (selectedBuckets.isEmpty()) return emptyList()
+        val allEntries = MediaScannerHelper.getUnifiedGalleryEntries(ctx, selectedBuckets)
+        if (offset >= allEntries.size || limit <= 0) return emptyList()
+        val slice = allEntries.subList(offset, minOf(offset + limit, allEntries.size))
+        return slice.map { entry ->
+            val (w, h) = if (entry.width > 0 && entry.height > 0) {
+                entry.width to entry.height
+            } else {
+                ImageSizeUtil.getImageDimensions(ctx, entry.uri) ?: (1 to 1)
             }
+            ImageUriItem(entry.id, entry.uri, w, h)
         }
-
-        val selection = "${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} LIKE ?"
-        val selectionArgs = arrayOf("%WhatsApp%")
-        val projection = arrayOf(
-            MediaStore.Images.Media._ID,
-            MediaStore.Images.Media.WIDTH,
-            MediaStore.Images.Media.HEIGHT
-        )
-        val sort = "${MediaStore.Images.Media.DATE_TAKEN} DESC, ${MediaStore.Images.Media._ID} DESC"
-        val cursor = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val b = Bundle().apply {
-                putInt(ContentResolver.QUERY_ARG_LIMIT, limit)
-                putInt(ContentResolver.QUERY_ARG_OFFSET, offset)
-                putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, sort)
-                putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
-                putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, selectionArgs)
-            }
-            contentResolver.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, projection, b, null)
-        } else {
-            contentResolver.query(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                projection,
-                selection,
-                selectionArgs,
-                "$sort LIMIT $limit OFFSET $offset"
-            )
-        }
-        val out = ArrayList<ImageUriItem>()
-        cursor?.use {
-            while (it.moveToNext()) {
-                val id = it.getLong(0)
-                out.add(
-                    ImageUriItem(
-                        id,
-                        ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id),
-                        it.getInt(1),
-                        it.getInt(2)
-                    )
-                )
-            }
-        }
-        return out
     }
 }
