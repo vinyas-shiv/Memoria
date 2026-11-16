@@ -71,7 +71,8 @@ class PhotoRepository(context: Context) {
             initializeedTextModel = true
         }
     }
-    suspend fun getFoldersList(): List<FolderCount> = dao.getAvailableFolders()
+    suspend fun getFoldersList(): List<FolderCount> =
+        dao.getAvailableFolders().filter { MediaScannerHelper.isWhatsAppFolder(it.folderPath) }
 
     suspend fun getCameraList() = dao.getAvailableCameras()
 
@@ -84,7 +85,8 @@ class PhotoRepository(context: Context) {
         searchFilters.folders,
         searchFilters.camera,
         foldersEmpty = searchFilters.folders.isEmpty()
-    )
+    ).filter { MediaScannerHelper.isWhatsAppFolder(it.folderPath) || it.uri.contains("whatsapp", ignoreCase = true) }
+
     suspend fun markAsFailed(uri: String) {
         if (alreadyExists(uri)) return
         dao.insert(PhotoEntity(
@@ -198,7 +200,9 @@ class PhotoRepository(context: Context) {
     }
     suspend fun pruneDeletedPhotos(currentUris: List<Uri>) {
         val currentUriStrings = currentUris.map { it.toString() }
-        dao.deleteWhereUriNotIn(currentUriStrings)
+        currentUriStrings.chunked(500).forEach { batch ->
+            dao.deleteWhereUriNotIn(batch)
+        }
     }
     suspend fun searchByImage(context : Context,image: Uri,indexedImages : List<PhotoEntity>) : List<Pair<PhotoEntity,Float>>{
         return withContext(Dispatchers.IO){
@@ -247,13 +251,8 @@ class PhotoRepository(context: Context) {
         image: Uri
     ): Int = withContext(Dispatchers.IO) {
         val selectedBuckets = folderPrefs.selectedBuckets.first()
-        val hasFsBuckets = selectedBuckets.any { it.startsWith(MediaScannerHelper.FS_BUCKET_PREFIX) }
-        if (hasFsBuckets || image.scheme == "file") {
-            val entries = MediaScannerHelper.getUnifiedGalleryEntries(context, selectedBuckets)
-            entries.indexOfFirst { it.uri == image }.coerceAtLeast(0)
-        } else {
-            getImagePosition(context.contentResolver, image)
-        }
+        val entries = MediaScannerHelper.getUnifiedGalleryEntries(context, selectedBuckets)
+        entries.indexOfFirst { it.uri == image }.coerceAtLeast(0)
     }
 
     suspend fun getImagePosition(
@@ -271,9 +270,10 @@ class PhotoRepository(context: Context) {
         contentResolver.query(
             uri,
             arrayOf(MediaStore.Images.Media._ID),
-            "${MediaStore.Images.Media.DATE_TAKEN} > ? OR " +
-                    "(${MediaStore.Images.Media.DATE_TAKEN} = ? AND ${MediaStore.Images.Media._ID} > ?)",
-            arrayOf(dateTaken.toString(), dateTaken.toString(), imageId.toString()),
+            "(${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} LIKE ?) AND " +
+                "(${MediaStore.Images.Media.DATE_TAKEN} > ? OR " +
+                "(${MediaStore.Images.Media.DATE_TAKEN} = ? AND ${MediaStore.Images.Media._ID} > ?))",
+            arrayOf("%WhatsApp%", dateTaken.toString(), dateTaken.toString(), imageId.toString()),
             null
         )?.use { it.count } ?: -1
     }
