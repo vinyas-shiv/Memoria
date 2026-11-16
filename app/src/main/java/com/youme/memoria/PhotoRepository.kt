@@ -34,10 +34,10 @@ data class SearchFilters(
     val confidence : Preset  = Preset.BALANCED
 )
 
-class PhotoRepository(context: Context) {
+class PhotoRepository(private val appContext: Context) {
 
-    private val dao = PhotosDatabase.getInstance(context).photoDao()
-    private val memoriaEncoder = MemoriaEncoder(context)
+    private val dao = PhotosDatabase.getInstance(appContext).photoDao()
+    private val memoriaEncoder = MemoriaEncoder(appContext)
 
     suspend fun getCountPhotos() = dao.count()
 
@@ -71,21 +71,28 @@ class PhotoRepository(context: Context) {
             initializeedTextModel = true
         }
     }
-    suspend fun getFoldersList(): List<FolderCount> =
-        dao.getAvailableFolders().filter { MediaScannerHelper.isWhatsAppFolder(it.folderPath) }
+    suspend fun getFoldersList(): List<FolderCount> = dao.getAvailableFolders()
 
     suspend fun getCameraList() = dao.getAvailableCameras()
 
 
     suspend fun alreadyExistsList() = dao.getAll()
 
-    suspend fun indexedImagesFiltered(searchFilters :SearchFilters ) = dao.getFiltered(
-        searchFilters.startDate,
-        searchFilters.endDate,
-        searchFilters.folders,
-        searchFilters.camera,
-        foldersEmpty = searchFilters.folders.isEmpty()
-    ).filter { MediaScannerHelper.isWhatsAppFolder(it.folderPath) || it.uri.contains("whatsapp", ignoreCase = true) }
+    suspend fun indexedImagesFiltered(searchFilters :SearchFilters ): List<PhotoEntity> {
+        val selectedBuckets = folderPrefs.selectedBuckets.first()
+        if (selectedBuckets.isEmpty()) return emptyList()
+        val allowedUris = withContext(Dispatchers.IO) {
+            MediaScannerHelper.getImagesForSelectedBuckets(appContext, selectedBuckets)
+                .mapTo(HashSet()) { it.toString() }
+        }
+        return dao.getFiltered(
+            searchFilters.startDate,
+            searchFilters.endDate,
+            searchFilters.folders,
+            searchFilters.camera,
+            foldersEmpty = searchFilters.folders.isEmpty()
+        ).filter { it.uri in allowedUris }
+    }
 
     suspend fun markAsFailed(uri: String) {
         if (alreadyExists(uri)) return
@@ -239,7 +246,7 @@ class PhotoRepository(context: Context) {
     suspend fun unloadModel() = imageModelMutex.withLock {memoriaEncoder.close()}
     fun unloadImageModel() = memoriaEncoder.freeImageEncoder()
 
-    val folderPrefs = FolderPrefs(context)
+    val folderPrefs = FolderPrefs(appContext)
 
     suspend fun getImagesToIndex(context: Context) : List<Uri> = withContext(Dispatchers.IO) {
         val selectedBuckets = folderPrefs.selectedBuckets.first()
@@ -270,10 +277,9 @@ class PhotoRepository(context: Context) {
         contentResolver.query(
             uri,
             arrayOf(MediaStore.Images.Media._ID),
-            "(${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} LIKE ?) AND " +
-                "(${MediaStore.Images.Media.DATE_TAKEN} > ? OR " +
-                "(${MediaStore.Images.Media.DATE_TAKEN} = ? AND ${MediaStore.Images.Media._ID} > ?))",
-            arrayOf("%WhatsApp%", dateTaken.toString(), dateTaken.toString(), imageId.toString()),
+            "${MediaStore.Images.Media.DATE_TAKEN} > ? OR " +
+                "(${MediaStore.Images.Media.DATE_TAKEN} = ? AND ${MediaStore.Images.Media._ID} > ?)",
+            arrayOf(dateTaken.toString(), dateTaken.toString(), imageId.toString()),
             null
         )?.use { it.count } ?: -1
     }
