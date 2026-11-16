@@ -1,9 +1,12 @@
 package com.youme.memoria.settings.FoldersManager
 
 import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.content.res.Resources
+import android.os.Build
 import android.os.Bundle
-import android.util.Log
+import android.provider.Settings
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -16,22 +19,22 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import androidx.room.util.query
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.card.MaterialCardView
 import com.youme.memoria.Gallery.IndexingViewModel
+import com.youme.memoria.MediaScannerHelper
 import com.youme.memoria.R
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 
 class FoldersManager : BottomSheetDialogFragment(R.layout.folders_manager_layout) {
     override fun getTheme(): Int = R.style.Theme_Memoria_BottomSheet
     private val indexingViewModel: IndexingViewModel by activityViewModels()
-    private lateinit var Adapter : FoldersAdapter
+    private lateinit var Adapter: FoldersAdapter
 
     @SuppressLint("StringFormatInvalid")
     override fun onStart() {
@@ -53,27 +56,27 @@ class FoldersManager : BottomSheetDialogFragment(R.layout.folders_manager_layout
         super.onViewCreated(view, savedInstanceState)
         val folderPref = indexingViewModel.folderPrefs
         val saveButton = requireView().findViewById<MaterialButton>(R.id.button17)
-        Adapter= FoldersAdapter(lifecycleScope)
+        Adapter = FoldersAdapter(lifecycleScope)
+
+        setupAllFilesAccessBanner()
         setupSearch()
+        setupRecyclerView()
+        setupSelectionButtons()
 
         saveButton.setOnClickListener {
             lifecycleScope.launch {
                 indexingViewModel.pause()
                 folderPref.setSelectedBuckets(Adapter.selectedFoldersFlow.value)
+                indexingViewModel.scanGallery()
                 dismiss()
             }
         }
 
-
-
         viewLifecycleOwner.lifecycleScope.launch {
             viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-
                 launch {
-                    folderPref.selectedBuckets.collectLatest {selectedBuckets->
-
+                    folderPref.selectedBuckets.collectLatest { selectedBuckets ->
                         Adapter.setSelected(selectedBuckets)
-                        setupRecyclerView()
                     }
                 }
                 launch {
@@ -84,44 +87,65 @@ class FoldersManager : BottomSheetDialogFragment(R.layout.folders_manager_layout
                         savedInDatastore != currentInAdapter
                     }.collectLatest { isDifferent ->
                         saveButton.isVisible = isDifferent
-
                     }
                 }
-
             }
         }
-
-        setupSelectionButtons()
-
-
     }
-    private fun setupSearch(){
+
+    override fun onResume() {
+        super.onResume()
+        updateAllFilesAccessBannerVisibility()
+        viewLifecycleOwner.lifecycleScope.launch {
+            indexingViewModel.getAvailableFolders()
+        }
+    }
+
+    private fun setupAllFilesAccessBanner() {
+        val grantBtn = requireView().findViewById<MaterialButton>(R.id.grantAllFilesBtn)
+        updateAllFilesAccessBannerVisibility()
+        grantBtn.setOnClickListener {
+            try {
+                startActivity(MediaScannerHelper.createAllFilesAccessIntent(requireContext()))
+            } catch (_: ActivityNotFoundException) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                }
+            }
+        }
+    }
+
+    private fun updateAllFilesAccessBannerVisibility() {
+        val banner = view?.findViewById<MaterialCardView>(R.id.allFilesBanner) ?: return
+        banner.isVisible = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+            !MediaScannerHelper.hasAllFilesAccess()
+    }
+
+    private fun setupSearch() {
         val searchInputText = requireView().findViewById<TextView>(R.id.searchInput)
-        searchInputText.doAfterTextChanged { query->
+        searchInputText.doAfterTextChanged { query ->
             Adapter.search(query.toString())
         }
     }
 
-    private fun setupRecyclerView(){
+    private fun setupRecyclerView() {
         val recyclerView = requireView().findViewById<RecyclerView>(R.id.recyclerView)
         recyclerView.apply {
             layoutManager =
                 LinearLayoutManager(requireContext(), LinearLayoutManager.VERTICAL, false)
-            adapter=Adapter
+            adapter = Adapter
         }
         viewLifecycleOwner.lifecycleScope.launch {
             viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-                indexingViewModel.folders.collectLatest {folders->
+                indexingViewModel.folders.collectLatest { folders ->
                     Adapter.submitData(folders)
-                    requireView().findViewById<View>(R.id.progress).isVisible=false
+                    requireView().findViewById<View>(R.id.progress).isVisible = false
                 }
             }
-
         }
-
-
     }
-    private fun setupSelectionButtons(){
+
+    private fun setupSelectionButtons() {
         val selecteAllButton = requireView().findViewById<Button>(R.id.button14)
         val deselecteAllButton = requireView().findViewById<Button>(R.id.button18)
 
@@ -131,6 +155,5 @@ class FoldersManager : BottomSheetDialogFragment(R.layout.folders_manager_layout
         deselecteAllButton.setOnClickListener {
             Adapter.setAllDeselected()
         }
-
     }
 }
