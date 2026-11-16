@@ -1,13 +1,9 @@
 package com.youme.memoria.Gallery
 
-import android.content.ContentUris
 import android.content.Context
-import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.BatteryManager
-import android.os.PowerManager
-import android.provider.MediaStore
 import android.text.format.Formatter
 import android.util.Log
 import android.widget.Toast
@@ -18,32 +14,25 @@ import androidx.lifecycle.viewModelScope
 import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.OverwritingInputMerger
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
-import androidx.work.setInputMerger
-import com.youme.memoria.Gallery.IndexingViewModel.IndexingState
-import com.youme.memoria.ImageSizeUtil
+import com.youme.memoria.MediaScannerHelper
 import com.youme.memoria.PhotoRepository
 import com.youme.memoria.roomCach.PhotosDatabase
 import com.youme.memoria.settings.FoldersManager.FolderPrefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
-
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
-import kotlin.coroutines.cancellation.CancellationException
+
 enum class ThermalStatus { GREEN, ORANGE, RED }
 data class FolderInfo(
     val rank: Int  = 0,
@@ -147,82 +136,33 @@ class IndexingViewModel(
             dbSize.value= Formatter.formatFileSize(appContext, sizeInBytes)
         }
     }
-    private fun existsInMediaStore(uri: Uri): Boolean =
-        try {
-            appContext.contentResolver.query(
-                uri, arrayOf(MediaStore.Images.Media._ID), null, null, null
-            )?.use { it.moveToFirst() } ?: false
-        } catch (e: Exception) {
-            false
-        }
 
     suspend fun scanGallery() {
+        val scanned = withContext(Dispatchers.IO) {
+            val selectedBuckets = folderPrefs.selectedBuckets.first()
+            MediaScannerHelper.getImagesForSelectedBuckets(appContext, selectedBuckets)
+        }
         imglistMutex.withLock {
             imglist.clear()
-
-            val selectedBuckets = folderPrefs.selectedBuckets.first()
-
-            val projection = arrayOf(
-                MediaStore.Images.Media._ID,
-                MediaStore.Images.Media.DISPLAY_NAME,
-                MediaStore.Images.Media.DATE_ADDED
-            )
-
-            val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
-
-            var selection: String? = null
-            var selectionArgs: Array<String>? = null
-
-            if (selectedBuckets.isNotEmpty()) {
-                val placeholders = selectedBuckets.joinToString(",") { "?" }
-                selection = "${MediaStore.Images.Media.BUCKET_ID} IN ($placeholders)"
-                selectionArgs = selectedBuckets.toTypedArray()
-            }
-
-            appContext.contentResolver.query(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                projection,
-                selection,
-                selectionArgs,
-                sortOrder
-            )?.use { cursor ->
-
-                val idCol =
-                    cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-
-                val nameCol =
-                    cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
-
-                while (cursor.moveToNext()) {
-
-                    val id = cursor.getLong(idCol)
-                    val name = cursor.getString(nameCol)
-
-                    val uri = ContentUris.withAppendedId(
-                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                        id
-                    )
-                    imglist.add(uri)
-                }
-            }
+            imglist.addAll(scanned)
+        }
         viewModelScope.launch {
             try {
+                val currentSnapshot = imglistMutex.withLock { imglist.toList() }
                 val alreadyExists = repo.alreadyExistsList().map { it.uri.toUri() }.toMutableList()
-                val imgSet = imglist.toHashSet()
-
+                val imgSet = currentSnapshot.toHashSet()
                 val inAlbums = dao.albumPhotoUris().map { it.uri }.toHashSet()
-
 
                 val toDelete = alreadyExists.filter { uri ->
                     if (uri in imgSet) return@filter false
                     if (uri.toString() in inAlbums) {
-                        !existsInMediaStore(uri)
+                        !MediaScannerHelper.mediaExists(appContext, uri)
                     } else {
                         true
                     }
                 }
 
-                if (toDelete.isNotEmpty() && imglist.isNotEmpty()) {
+                if (toDelete.isNotEmpty() && currentSnapshot.isNotEmpty()) {
                     Toast.makeText(appContext, "Found ${toDelete.size} missing image(s). Deleting them now.", Toast.LENGTH_SHORT).show()
                     viewModelScope.launch {
                         repo.pruneDeletedPhotos(toDelete)
@@ -230,25 +170,23 @@ class IndexingViewModel(
                 }
 
                 val indexedInScope = alreadyExists.count { it in imgSet }
-                if (indexedInScope == imglist.size){
-                    _state.value = IndexingState.Completed(imglist.size)
-                }else{
-                    if (imglist.isNotEmpty())  _state.value = IndexingState.Ready(indexedInScope,imglist.size)
+                if (indexedInScope == currentSnapshot.size) {
+                    _state.value = IndexingState.Completed(currentSnapshot.size)
+                } else {
+                    if (currentSnapshot.isNotEmpty()) {
+                        _state.value = IndexingState.Ready(indexedInScope, currentSnapshot.size)
+                    }
                 }
-            }catch (e: Exception){
+            } catch (e: Exception) {
                 Log.e("Cleanup", "prune failed", e)
             }
         }
-
-
-    }
     }
 
 
     fun getBatteryTemperature() {
         val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
         val batteryStatus = appContext.registerReceiver(null, intentFilter)
-
         val tempTenths = batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
 
         batteryTemp.value =  tempTenths / 10.0f
@@ -275,41 +213,7 @@ class IndexingViewModel(
         super.onCleared()
     }
     suspend fun getAvailableFolders() = withContext(Dispatchers.IO) {
-        val folders = LinkedHashMap<String, FolderInfo>()
-
-        val projection = arrayOf(
-            MediaStore.Images.Media.BUCKET_ID,
-            MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
-            MediaStore.Images.Media.RELATIVE_PATH
-        )
-
-        appContext.contentResolver.query(
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            projection,
-            null,
-            null,
-            null
-        )?.use { cursor ->
-            val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_ID)
-            val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
-            val pathId = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.RELATIVE_PATH)
-
-
-            while (cursor.moveToNext()) {
-                val bucketId = cursor.getString(idCol) ?: continue
-                val bucketName = cursor.getString(nameCol) ?: "Unknown"
-                val path  = cursor.getString(pathId)?:"Unknown"
-
-                val existing = folders[bucketId]
-                folders[bucketId] = FolderInfo(0,
-                    bucketId,
-                    bucketName,
-                    path,
-                    (existing?.itemCount ?: 0) + 1
-                )
-            }
-        }
-        _Folders.value =folders.values.filter { it.itemCount>0 }.sortedByDescending { it.itemCount }
+        _Folders.value = MediaScannerHelper.getAvailableFolders(appContext)
     }
 
     private fun FolderInfo.segments() = folderPath.split("/").filter { it.isNotEmpty() }
@@ -328,7 +232,6 @@ class IndexingViewModel(
             val exact = group.firstOrNull { it.segments().size == depth + 1 }
             val deeper = group.filter { it.segments().size > depth + 1 }
             val subFolders = treeFolders(deeper, depth + 1)
-
             val path = group.first().segments().take(depth + 1).joinToString("/") + "/"
 
             when {
