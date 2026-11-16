@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.Settings
 import androidx.core.content.FileProvider
@@ -24,6 +25,29 @@ data class GalleryMediaEntry(
 object MediaScannerHelper {
 
     const val FS_BUCKET_PREFIX = "fs:"
+    private const val CACHE_TTL_MS = 30_000L
+
+    private val cacheLock = Any()
+    private var cachedGalleryBucketsKey: Set<String>? = null
+    private var cachedGalleryEntries: List<GalleryMediaEntry>? = null
+    private var cachedGalleryTimestampMs: Long = 0L
+
+    private var cachedIndexBucketsKey: Set<String>? = null
+    private var cachedIndexUris: List<Uri>? = null
+    private var cachedIndexTimestampMs: Long = 0L
+
+    private var cachedStorageRoots: List<File>? = null
+
+    fun invalidateCache() {
+        synchronized(cacheLock) {
+            cachedGalleryBucketsKey = null
+            cachedGalleryEntries = null
+            cachedGalleryTimestampMs = 0L
+            cachedIndexBucketsKey = null
+            cachedIndexUris = null
+            cachedIndexTimestampMs = 0L
+        }
+    }
 
     private val IMAGE_EXTENSIONS = setOf(
         "jpg", "jpeg", "png", "webp", "heic", "heif", "bmp", "avif"
@@ -95,6 +119,7 @@ object MediaScannerHelper {
     }
 
     fun getStorageRoots(context: Context): List<File> {
+        cachedStorageRoots?.let { if (it.isNotEmpty()) return it }
         val roots = LinkedHashMap<String, File>()
         runCatching {
             val primary = Environment.getExternalStorageDirectory()
@@ -111,7 +136,11 @@ object MediaScannerHelper {
                 }
             }
         }
-        return roots.values.toList()
+        val list = roots.values.toList()
+        if (list.isNotEmpty()) {
+            cachedStorageRoots = list
+        }
+        return list
     }
 
     fun getRelativeFolderPath(context: Context, dir: File?): String {
@@ -321,6 +350,17 @@ object MediaScannerHelper {
     fun getImagesForSelectedBuckets(context: Context, selectedBuckets: Set<String>): List<Uri> {
         if (selectedBuckets.isEmpty()) return emptyList()
 
+        val now = SystemClock.elapsedRealtime()
+        synchronized(cacheLock) {
+            val cached = cachedIndexUris
+            if (cached != null &&
+                cachedIndexBucketsKey == selectedBuckets &&
+                now - cachedIndexTimestampMs < CACHE_TTL_MS
+            ) {
+                return cached
+            }
+        }
+
         val result = ArrayList<Uri>()
         val mediaStorePaths = HashSet<String>()
 
@@ -426,6 +466,11 @@ object MediaScannerHelper {
             hiddenFiles.forEach { result.add(Uri.fromFile(it)) }
         }
 
+        synchronized(cacheLock) {
+            cachedIndexBucketsKey = selectedBuckets.toSet()
+            cachedIndexUris = result
+            cachedIndexTimestampMs = SystemClock.elapsedRealtime()
+        }
         return result
     }
 
@@ -435,6 +480,17 @@ object MediaScannerHelper {
         selectedBuckets: Set<String>
     ): List<GalleryMediaEntry> {
         if (selectedBuckets.isEmpty()) return emptyList()
+
+        val now = SystemClock.elapsedRealtime()
+        synchronized(cacheLock) {
+            val cached = cachedGalleryEntries
+            if (cached != null &&
+                cachedGalleryBucketsKey == selectedBuckets &&
+                now - cachedGalleryTimestampMs < CACHE_TTL_MS
+            ) {
+                return cached
+            }
+        }
 
         val entries = ArrayList<GalleryMediaEntry>()
         val mediaStorePaths = HashSet<String>()
@@ -521,16 +577,20 @@ object MediaScannerHelper {
                     } else {
                         cursor.getLong(dateAddedCol) * 1000L
                     }
+                    val w = cursor.getInt(widthCol)
+                    val h = cursor.getInt(heightCol)
+                    val contentUri = ContentUris.withAppendedId(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        id
+                    )
+                    ImageSizeUtil.cacheDimensions(contentUri, w, h)
                     entries.add(
                         GalleryMediaEntry(
                             id = id,
-                            uri = ContentUris.withAppendedId(
-                                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                                id
-                            ),
+                            uri = contentUri,
                             dateTaken = dateMillis,
-                            width = cursor.getInt(widthCol),
-                            height = cursor.getInt(heightCol)
+                            width = w,
+                            height = h
                         )
                     )
                 }
@@ -574,6 +634,11 @@ object MediaScannerHelper {
                 .thenByDescending { it.id }
         )
 
+        synchronized(cacheLock) {
+            cachedGalleryBucketsKey = selectedBuckets.toSet()
+            cachedGalleryEntries = entries
+            cachedGalleryTimestampMs = SystemClock.elapsedRealtime()
+        }
         return entries
     }
 
