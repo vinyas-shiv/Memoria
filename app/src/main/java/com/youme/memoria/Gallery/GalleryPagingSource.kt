@@ -48,85 +48,27 @@ class GalleryPagingSource(
     }
 
     private suspend fun queryPage(page: Int, pageSize: Int): Pair<List<DateImageBlocks>, Int> {
-        val ctx = appContext
-        if (ctx != null) {
-            val selectedBuckets = FolderPrefs(ctx).selectedBuckets.first()
-            val allEntries = MediaScannerHelper.getUnifiedGalleryEntries(ctx, selectedBuckets)
-            val offset = page * pageSize
-            if (offset >= allEntries.size) return emptyList<DateImageBlocks>() to 0
-            val slice = allEntries.subList(offset, minOf(offset + pageSize, allEntries.size))
-            val blocks = LinkedHashMap<String, DateImageBlocks>()
-            val fmt = SimpleDateFormat("MMMM dd, yyyy", Locale.getDefault())
-            for (entry in slice) {
-                val (w, h) = if (entry.width > 0 && entry.height > 0) {
-                    entry.width to entry.height
-                } else {
-                    ImageSizeUtil.getImageDimensions(ctx, entry.uri) ?: (1 to 1)
-                }
-                val date = fmt.format(Date(entry.dateTaken))
-                blocks.getOrPut(date) { DateImageBlocks(date, mutableListOf()) }
-                    .images.add(ImageUriItem(entry.id, entry.uri, w, h))
-            }
-            return blocks.values.toList() to slice.size
-        }
+        val ctx = appContext ?: return emptyList<DateImageBlocks>() to 0
+        val selectedBuckets = FolderPrefs(ctx).selectedBuckets.first()
+        if (selectedBuckets.isEmpty()) return emptyList<DateImageBlocks>() to 0
 
-        val selection = "${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} LIKE ?"
-        val selectionArgs = arrayOf("%WhatsApp%")
-        val projection = arrayOf(
-            MediaStore.Images.Media._ID,
-            MediaStore.Images.Media.DATE_TAKEN,
-            MediaStore.Images.Media.WIDTH,
-            MediaStore.Images.Media.HEIGHT
-        )
-        val sortOrder =
-            "${MediaStore.Images.Media.DATE_TAKEN} DESC, ${MediaStore.Images.Media._ID} DESC"
+        val allEntries = MediaScannerHelper.getUnifiedGalleryEntries(ctx, selectedBuckets)
         val offset = page * pageSize
-
-        val cursor = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bundle = Bundle().apply {
-                putInt(ContentResolver.QUERY_ARG_LIMIT, pageSize)
-                putInt(ContentResolver.QUERY_ARG_OFFSET, offset)
-                putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, sortOrder)
-                putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
-                putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, selectionArgs)
-            }
-            contentResolver.query(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                projection,
-                bundle,
-                null
-            )
-        } else {
-            contentResolver.query(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                projection,
-                selection,
-                selectionArgs,
-                "$sortOrder LIMIT $pageSize OFFSET $offset"
-            )
-        }
-
+        if (offset >= allEntries.size) return emptyList<DateImageBlocks>() to 0
+        val slice = allEntries.subList(offset, minOf(offset + pageSize, allEntries.size))
         val blocks = LinkedHashMap<String, DateImageBlocks>()
-        var rows = 0
         val fmt = SimpleDateFormat("MMMM dd, yyyy", Locale.getDefault())
-
-        cursor?.use {
-            val idCol = it.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-            val dateCol = it.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
-            val widthCol = it.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
-            val heightCol = it.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
-
-            while (it.moveToNext()) {
-                rows++
-                val id = it.getLong(idCol)
-                val uri =
-                    ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-                val date = fmt.format(Date(it.getLong(dateCol)))
-                blocks.getOrPut(date) { DateImageBlocks(date, mutableListOf()) }
-                    .images.add(ImageUriItem(id, uri, it.getInt(widthCol), it.getInt(heightCol)))
+        for (entry in slice) {
+            val (w, h) = if (entry.width > 0 && entry.height > 0) {
+                entry.width to entry.height
+            } else {
+                ImageSizeUtil.getImageDimensions(ctx, entry.uri) ?: (1 to 1)
             }
+            val date = fmt.format(Date(entry.dateTaken))
+            blocks.getOrPut(date) { DateImageBlocks(date, mutableListOf()) }
+                .images.add(ImageUriItem(entry.id, entry.uri, w, h))
         }
-        return blocks.values.toList() to rows
+        return blocks.values.toList() to slice.size
     }
 }
 
