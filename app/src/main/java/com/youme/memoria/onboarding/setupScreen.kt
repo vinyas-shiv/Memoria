@@ -13,12 +13,12 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.core.view.isVisible
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.button.MaterialButton
 import com.youme.memoria.Gallery.IndexingViewModel
 import com.youme.memoria.Gallery.IndexingViewModelFactory
 import com.youme.memoria.MainActivity
+import com.youme.memoria.MediaScannerHelper
 import com.youme.memoria.PhotoRepository
 import com.youme.memoria.R
 import com.youme.memoria.settings.FoldersManager.FolderPrefs
@@ -26,13 +26,12 @@ import com.youme.memoria.settings.FoldersManager.FoldersManager
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
-import kotlin.getValue
 
 class SetupScreen : AppCompatActivity() {
 
     private lateinit var repo: PhotoRepository
-    private lateinit var folderPref : FolderPrefs
-    private val indexingViewModel: IndexingViewModel by viewModels(){
+    private lateinit var folderPref: FolderPrefs
+    private val indexingViewModel: IndexingViewModel by viewModels {
         IndexingViewModelFactory(repo, this.applicationContext)
     }
     private val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -40,7 +39,6 @@ class SetupScreen : AppCompatActivity() {
     } else {
         Manifest.permission.READ_EXTERNAL_STORAGE
     }
-
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -53,13 +51,33 @@ class SetupScreen : AppCompatActivity() {
         setupFinal()
     }
 
-    private fun setupFinal(){
+    override fun onResume() {
+        super.onResume()
+        if (hasMediaOrAllFilesPermission()) {
+            indexingViewModel.setPermission(true)
+            lifecycleScope.launch {
+                indexingViewModel.getAvailableFolders()
+            }
+        }
+    }
+
+    private fun hasMediaOrAllFilesPermission(): Boolean {
+        val stdGranted = ContextCompat.checkSelfPermission(
+            this,
+            permission
+        ) == PackageManager.PERMISSION_GRANTED
+        val allFilesGranted = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+            MediaScannerHelper.hasAllFilesAccess()
+        return stdGranted || allFilesGranted
+    }
+
+    private fun setupFinal() {
         val continueButton = findViewById<Button>(R.id.button16)
         lifecycleScope.launch {
-            combine(indexingViewModel.isPermissionGrandted,folderPref.selectedBuckets){hasMediaAccess,selectedFolders->
-                hasMediaAccess && (selectedFolders.isNotEmpty())
-            }.collectLatest {isGranted->
-                continueButton.isEnabled =isGranted
+            combine(indexingViewModel.isPermissionGrandted, folderPref.selectedBuckets) { hasMediaAccess, selectedFolders ->
+                hasMediaAccess && selectedFolders.isNotEmpty()
+            }.collectLatest { isGranted ->
+                continueButton.isEnabled = isGranted
             }
         }
 
@@ -67,64 +85,48 @@ class SetupScreen : AppCompatActivity() {
             lifecycleScope.launch {
                 OnboardingPrefs.setOnboardingDone(this@SetupScreen, true)
                 val intent = Intent(this@SetupScreen, MainActivity::class.java)
-                intent.flags=Intent.FLAG_ACTIVITY_CLEAR_TASK or FLAG_ACTIVITY_NEW_TASK
+                intent.flags = Intent.FLAG_ACTIVITY_CLEAR_TASK or FLAG_ACTIVITY_NEW_TASK
                 startActivity(intent)
             }
-
         }
     }
 
-    private fun setupMediaAccess(){
+    private fun setupMediaAccess() {
         val permissionButton = findViewById<MaterialButton>(R.id.perButton)
         lifecycleScope.launch {
-            indexingViewModel.isPermissionGrandted.collectLatest { isGranted->
+            indexingViewModel.isPermissionGrandted.collectLatest { isGranted ->
                 permissionButton.isEnabled = !isGranted
                 permissionButton.text = if (isGranted) "Permission Granted" else "Grant Media Permission"
-                findViewById<MaterialButton>(R.id.SelFolder).isEnabled=isGranted
-
+                findViewById<MaterialButton>(R.id.SelFolder).isEnabled = isGranted
                 indexingViewModel.getAvailableFolders()
-
             }
         }
 
         permissionButton.setOnClickListener {
-            requestPermissionLauncher.launch(
-                permission
-            )
+            requestPermissionLauncher.launch(permission)
         }
     }
 
-    private fun setupFolderSelection(){
-
-        val foldersSelectionButton =findViewById<MaterialButton>(R.id.SelFolder)
+    private fun setupFolderSelection() {
+        val foldersSelectionButton = findViewById<MaterialButton>(R.id.SelFolder)
         val selectedTextInto = findViewById<TextView>(R.id.textView31)
 
-
-
-
-
         foldersSelectionButton.setOnClickListener {
-            FoldersManager().show(supportFragmentManager,"")
+            FoldersManager().show(supportFragmentManager, "")
         }
 
-
-
         lifecycleScope.launch {
-            indexingViewModel.folderPrefs.selectedBuckets.collectLatest {selectedFolders->
+            indexingViewModel.folderPrefs.selectedBuckets.collectLatest { selectedFolders ->
                 selectedTextInto.text = "${selectedFolders.size} Selected"
             }
         }
-
-
-
-
-
     }
+
     val requestPermissionLauncher =
         registerForActivityResult(
             ActivityResultContracts.RequestPermission()
         ) { isGranted ->
-            if (isGranted) {
+            if (isGranted || hasMediaOrAllFilesPermission()) {
                 indexingViewModel.setPermission(true)
             } else {
                 Toast.makeText(
@@ -135,18 +137,12 @@ class SetupScreen : AppCompatActivity() {
                 indexingViewModel.setPermission(false)
             }
         }
+
     private fun requestGalleryPermission() {
-        when {
-            ContextCompat.checkSelfPermission(
-                this@SetupScreen,
-                permission
-            ) == PackageManager.PERMISSION_GRANTED -> {
-                lifecycleScope.launch {
-                    indexingViewModel.setPermission(true)
-                }
+        if (hasMediaOrAllFilesPermission()) {
+            lifecycleScope.launch {
+                indexingViewModel.setPermission(true)
             }
         }
     }
-
-
 }
