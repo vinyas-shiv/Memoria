@@ -2,18 +2,24 @@ package com.youme.memoria.imageViewer
 
 import android.content.ContentResolver
 import android.content.ContentUris
+import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import androidx.paging.PagingSource
 import androidx.paging.PagingState
 import com.youme.memoria.ImageLoading.ImageUriItem
+import com.youme.memoria.ImageSizeUtil
+import com.youme.memoria.MediaScannerHelper
+import com.youme.memoria.settings.FoldersManager.FolderPrefs
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 
 class ImageViewerPagingSource(
     private val contentResolver: ContentResolver,
-    private val totalCount: Int
+    private val totalCount: Int,
+    private val appContext: Context? = null
 ) : PagingSource<Int, ImageUriItem>() {
 
     override fun getRefreshKey(state: PagingState<Int, ImageUriItem>): Int? =
@@ -35,12 +41,34 @@ class ImageViewerPagingSource(
                     itemsBefore = start,
                     itemsAfter = (totalCount - start - items.size).coerceAtLeast(0)
                 )
-            } catch (e: Exception) { LoadResult.Error(e) }
+            } catch (e: Exception) {
+                LoadResult.Error(e)
+            }
         }
 
-    private fun query(offset: Int, limit: Int): List<ImageUriItem> {
+    private suspend fun query(offset: Int, limit: Int): List<ImageUriItem> {
+        val ctx = appContext
+        if (ctx != null) {
+            val selectedBuckets = FolderPrefs(ctx).selectedBuckets.first()
+            if (selectedBuckets.any { it.startsWith(MediaScannerHelper.FS_BUCKET_PREFIX) }) {
+                val allEntries = MediaScannerHelper.getUnifiedGalleryEntries(ctx, selectedBuckets)
+                if (offset >= allEntries.size || limit <= 0) return emptyList()
+                val slice = allEntries.subList(offset, minOf(offset + limit, allEntries.size))
+                return slice.map { entry ->
+                    val (w, h) = if (entry.width > 0 && entry.height > 0) {
+                        entry.width to entry.height
+                    } else {
+                        ImageSizeUtil.getImageDimensions(ctx, entry.uri) ?: (1 to 1)
+                    }
+                    ImageUriItem(entry.id, entry.uri, w, h)
+                }
+            }
+        }
+
         val projection = arrayOf(
-            MediaStore.Images.Media._ID, MediaStore.Images.Media.WIDTH, MediaStore.Images.Media.HEIGHT
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.WIDTH,
+            MediaStore.Images.Media.HEIGHT
         )
         val sort = "${MediaStore.Images.Media.DATE_TAKEN} DESC, ${MediaStore.Images.Media._ID} DESC"
         val cursor = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -60,9 +88,14 @@ class ImageViewerPagingSource(
         cursor?.use {
             while (it.moveToNext()) {
                 val id = it.getLong(0)
-                out.add(ImageUriItem(id,
-                    ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id),
-                    it.getInt(1), it.getInt(2)))
+                out.add(
+                    ImageUriItem(
+                        id,
+                        ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id),
+                        it.getInt(1),
+                        it.getInt(2)
+                    )
+                )
             }
         }
         return out
