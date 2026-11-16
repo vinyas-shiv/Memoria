@@ -3,6 +3,7 @@ package com.youme.memoria.Gallery
 import android.database.ContentObserver
 import android.os.Handler
 import android.util.Log
+import com.youme.memoria.MediaScannerHelper
 
 class GalleryObserver(
     handler: Handler
@@ -10,7 +11,7 @@ class GalleryObserver(
 
     override fun onChange(selfChange: Boolean) {
         super.onChange(selfChange)
-        Log.d("GalleryObserver", "MediaStore changed")
+        MediaScannerHelper.invalidateCache()
+        Log.d("GalleryObserver", "MediaStore changed, cache invalidated")
     }
-
 }
