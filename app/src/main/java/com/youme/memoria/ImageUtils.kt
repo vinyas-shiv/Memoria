@@ -5,13 +5,32 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.util.LruCache
 import androidx.exifinterface.media.ExifInterface
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Locale
 
+data class ExifMetadata(
+    val dateTaken: Long?,
+    val cameraMake: String?,
+    val cameraModel: String?
+)
+
 object ImageSizeUtil {
+
+    private val dimensionsCache = LruCache<String, Pair<Int, Int>>(4096)
+
+    fun cacheDimensions(uri: Uri, width: Int, height: Int) {
+        if (width > 0 && height > 0) {
+            dimensionsCache.put(uri.toString(), width to height)
+        }
+    }
+
     fun getImageDimensions(context: Context, uri: Uri): Pair<Int, Int>? {
+        val key = uri.toString()
+        dimensionsCache.get(key)?.let { return it }
+
         return try {
             val options = BitmapFactory.Options().apply {
                 inJustDecodeBounds = true
@@ -25,11 +44,60 @@ object ImageSizeUtil {
                 }
             }
             if (options.outWidth > 0 && options.outHeight > 0) {
-                options.outWidth to options.outHeight
+                val pair = options.outWidth to options.outHeight
+                dimensionsCache.put(key, pair)
+                pair
             } else null
         } catch (e: Exception) {
             null
         }
+    }
+
+    private fun readExifSinglePass(context: Context, uri: Uri): ExifMetadata {
+        return try {
+            val exif = if (uri.scheme == "file") {
+                val filePath = uri.path ?: return ExifMetadata(null, null, null)
+                val f = File(filePath)
+                if (!f.exists()) return ExifMetadata(null, null, null)
+                ExifInterface(f)
+            } else {
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    ExifInterface(stream)
+                } ?: return ExifMetadata(null, null, null)
+            }
+
+            val rawDate = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
+            val parsedDate = rawDate?.let {
+                runCatching {
+                    SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).parse(it)?.time
+                }.getOrNull()
+            }
+            val make = exif.getAttribute(ExifInterface.TAG_MAKE)
+            val model = exif.getAttribute(ExifInterface.TAG_MODEL)
+            ExifMetadata(parsedDate, make, model)
+        } catch (_: Exception) {
+            ExifMetadata(null, null, null)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    fun getCombinedMetadata(
+        context: Context,
+        uri: Uri
+    ): Triple<Long?, String?, Pair<String?, String?>> {
+        val exifMeta = readExifSinglePass(context, uri)
+        if (uri.scheme == "file") {
+            val filePath = uri.path ?: return Triple(null, null, exifMeta.cameraMake to exifMeta.cameraModel)
+            val file = File(filePath)
+            if (!file.exists()) return Triple(null, null, exifMeta.cameraMake to exifMeta.cameraModel)
+            val dateTaken = exifMeta.dateTaken ?: file.lastModified()
+            val relPath = MediaScannerHelper.getRelativeFolderPath(context, file.parentFile)
+            return Triple(dateTaken, relPath, exifMeta.cameraMake to exifMeta.cameraModel)
+        }
+
+        val meta = getPhotoMetadata(context, uri)
+        return Triple(meta?.first ?: exifMeta.dateTaken, meta?.second, exifMeta.cameraMake to exifMeta.cameraModel)
     }
 
     @Suppress("DEPRECATION")
@@ -38,16 +106,7 @@ object ImageSizeUtil {
             val filePath = uri.path ?: return null
             val file = File(filePath)
             if (!file.exists()) return null
-            val exifDate = try {
-                val exif = ExifInterface(file)
-                val rawDate = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
-                    ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
-                rawDate?.let {
-                    SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).parse(it)?.time
-                }
-            } catch (_: Exception) {
-                null
-            }
+            val exifDate = readExifSinglePass(context, uri).dateTaken
             val dateTaken = exifDate ?: file.lastModified()
             val relPath = MediaScannerHelper.getRelativeFolderPath(context, file.parentFile)
             return Pair(dateTaken, relPath)
@@ -98,23 +157,7 @@ object ImageSizeUtil {
     }
 
     fun getCameraInfo(context: Context, uri: Uri): Pair<String?, String?> {
-        return try {
-            if (uri.scheme == "file") {
-                val filePath = uri.path ?: return (null to null)
-                val exif = ExifInterface(File(filePath))
-                val make = exif.getAttribute(ExifInterface.TAG_MAKE)
-                val model = exif.getAttribute(ExifInterface.TAG_MODEL)
-                make to model
-            } else {
-                context.contentResolver.openInputStream(uri)?.use { stream ->
-                    val exif = ExifInterface(stream)
-                    val make = exif.getAttribute(ExifInterface.TAG_MAKE)
-                    val model = exif.getAttribute(ExifInterface.TAG_MODEL)
-                    make to model
-                } ?: (null to null)
-            }
-        } catch (e: Exception) {
-            null to null
-        }
+        val meta = readExifSinglePass(context, uri)
+        return meta.cameraMake to meta.cameraModel
     }
 }
