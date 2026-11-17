@@ -22,7 +22,7 @@ import com.youme.memoria.MediaScannerHelper
 import com.youme.memoria.MemoriaApp
 import com.youme.memoria.R
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.cancellation.CancellationException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
