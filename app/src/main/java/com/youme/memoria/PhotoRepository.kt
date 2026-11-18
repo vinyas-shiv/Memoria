@@ -8,11 +8,13 @@ import android.graphics.ImageDecoder
 import android.net.Uri
 import android.provider.MediaStore
 import com.youme.memoria.Encoder.MemoriaEncoder
+import com.youme.memoria.ImageLoading.ImageUriItem
 import com.youme.memoria.roomCach.FolderCount
 import com.youme.memoria.roomCach.PhotoEntity
 import com.youme.memoria.roomCach.PhotosDatabase
 import com.youme.memoria.roomCach.toByteArray
 import com.youme.memoria.roomCach.toFloatArray
+import com.youme.memoria.search.SearchDateGroup
 import com.youme.memoria.settings.FoldersManager.FolderPrefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -22,16 +24,27 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 
-enum class Preset(val score: Float) {
-    LOOSE(0.14f), BALANCED(0.18f), STRICT(0.22f)
+enum class Preset(
+    val score: Float,
+    val imageScore: Float,
+    val maxImageResults: Int
+) {
+    LOOSE(0.14f, 0.38f, 250),
+    BALANCED(0.18f, 0.46f, 150),
+    STRICT(0.22f, 0.56f, 80)
 }
+
 data class SearchFilters(
     val startDate: Long?,
     val endDate: Long?,
     val folders: List<String>,
     val camera: String?,
-    val confidence : Preset  = Preset.BALANCED
+    val confidence: Preset = Preset.BALANCED
 )
 
 private class DecodedEmbeddingEntry(
@@ -100,7 +113,6 @@ class PhotoRepository(private val appContext: Context) {
                     embeddingCacheByUri.clear()
                     for (row in rows) {
                         if (row.embedding.isNotEmpty()) {
-                            // Keep empty ByteArray on cached entity copy to halve heap footprint while preserving metadata
                             val lightEntity = row.copy(embedding = NON_EMPTY_MARKER)
                             embeddingCacheByUri[row.uri] = DecodedEmbeddingEntry(
                                 entity = lightEntity,
@@ -138,6 +150,127 @@ class PhotoRepository(private val appContext: Context) {
             out.add(e)
         }
         return out
+    }
+
+    suspend fun buildSearchDateGroups(
+        matches: List<Pair<PhotoEntity, Float>>
+    ): List<SearchDateGroup> = withContext(Dispatchers.Default) {
+        if (matches.isEmpty()) return@withContext emptyList()
+
+        val selectedBuckets = folderPrefs.selectedBuckets.first()
+        val galleryEntries = if (selectedBuckets.isEmpty()) {
+            emptyList()
+        } else {
+            withContext(Dispatchers.IO) {
+                MediaScannerHelper.getUnifiedGalleryEntries(appContext, selectedBuckets)
+            }
+        }
+
+        val matchedUriSet = matches.mapTo(HashSet(matches.size * 2)) { it.first.uri }
+        val matchedGalleryMap = HashMap<String, GalleryMediaEntry>(matches.size * 2)
+        for (entry in galleryEntries) {
+            val u = entry.uri.toString()
+            if (u in matchedUriSet) {
+                matchedGalleryMap[u] = entry
+            }
+        }
+
+        val cal = Calendar.getInstance()
+        fun dayCodeFor(millis: Long): Int {
+            if (millis <= 0L) return 0
+            cal.timeInMillis = millis
+            return cal.get(Calendar.YEAR) * 10_000 +
+                (cal.get(Calendar.MONTH) + 1) * 100 +
+                cal.get(Calendar.DAY_OF_MONTH)
+        }
+
+        class MutableDayBucket(
+            val dayCode: Int,
+            var maxTimestamp: Long,
+            var bestScore: Float
+        ) {
+            val matchedItems = ArrayList<ImageUriItem>()
+            val matchedSeen = HashSet<String>()
+            val allDayItems = ArrayList<ImageUriItem>()
+            val allDaySeen = HashSet<String>()
+        }
+
+        val bucketsByDayCode = LinkedHashMap<Int, MutableDayBucket>()
+
+        for ((photo, score) in matches) {
+            val galleryEntry = matchedGalleryMap[photo.uri]
+            val ts = galleryEntry?.dateTaken?.takeIf { it > 0L }
+                ?: photo.dateTaken?.takeIf { it > 0L }
+                ?: 0L
+            val code = dayCodeFor(ts)
+            val w = if (photo.width > 0) photo.width else (galleryEntry?.width ?: 1)
+            val h = if (photo.height > 0) photo.height else (galleryEntry?.height ?: 1)
+            val parsedUri = galleryEntry?.uri ?: Uri.parse(photo.uri)
+            val id = galleryEntry?.id ?: photo.uri.hashCode().toLong()
+
+            val bucket = bucketsByDayCode.getOrPut(code) {
+                MutableDayBucket(
+                    dayCode = code,
+                    maxTimestamp = ts,
+                    bestScore = score
+                )
+            }
+            if (ts > bucket.maxTimestamp) bucket.maxTimestamp = ts
+            if (score > bucket.bestScore) bucket.bestScore = score
+            if (bucket.matchedSeen.add(photo.uri)) {
+                bucket.matchedItems.add(ImageUriItem(id = id, uri = parsedUri, width = w, height = h))
+            }
+        }
+
+        if (bucketsByDayCode.isEmpty()) return@withContext emptyList()
+
+        for (entry in galleryEntries) {
+            if (entry.dateTaken <= 0L) continue
+            val code = dayCodeFor(entry.dateTaken)
+            val bucket = bucketsByDayCode[code] ?: continue
+            val uriStr = entry.uri.toString()
+            if (entry.dateTaken > bucket.maxTimestamp) {
+                bucket.maxTimestamp = entry.dateTaken
+            }
+            if (bucket.allDaySeen.add(uriStr)) {
+                val w = if (entry.width > 0) entry.width else 1
+                val h = if (entry.height > 0) entry.height else 1
+                bucket.allDayItems.add(
+                    ImageUriItem(
+                        id = entry.id,
+                        uri = entry.uri,
+                        width = w,
+                        height = h
+                    )
+                )
+            }
+        }
+
+        for (bucket in bucketsByDayCode.values) {
+            for (m in bucket.matchedItems) {
+                if (bucket.allDaySeen.add(m.uri.toString())) {
+                    bucket.allDayItems.add(m)
+                }
+            }
+        }
+
+        val labelFmt = SimpleDateFormat("MMMM dd, yyyy", Locale.getDefault())
+        bucketsByDayCode.values.map { bucket ->
+            val label = if (bucket.dayCode == 0 || bucket.maxTimestamp <= 0L) {
+                "Unknown date"
+            } else {
+                labelFmt.format(Date(bucket.maxTimestamp))
+            }
+            SearchDateGroup(
+                dayKey = bucket.dayCode.toString(),
+                dateLabel = label,
+                dayTimestamp = bucket.maxTimestamp,
+                bestScore = bucket.bestScore,
+                matchedImages = bucket.matchedItems,
+                allDayImages = bucket.allDayItems,
+                isExpanded = false
+            )
+        }
     }
 
     suspend fun markAsFailed(uri: String) {
@@ -290,24 +423,51 @@ class PhotoRepository(private val appContext: Context) {
     suspend fun searchByImage(
         context: Context,
         image: Uri,
-        indexedImages: List<PhotoEntity>
+        indexedImages: List<PhotoEntity>,
+        confidence: Preset = Preset.BALANCED
     ): List<Pair<PhotoEntity, Float>> {
-        return withContext(Dispatchers.IO) {
-            if (indexedImages.isEmpty()) return@withContext emptyList()
-            ensureEmbeddingCacheLoaded()
-            memoriaEncoder.initializeImageEncoder()
+        if (indexedImages.isEmpty()) return emptyList()
+        ensureEmbeddingCacheLoaded()
+        val encodedImage = withContext(Dispatchers.IO) {
+            initializeImageModel()
             val (bitmap, _) = decodeBitmapAndDimensions(context, image)
-            val encodedImage = try {
+            try {
                 memoriaEncoder.encodeImage(bitmap)
             } finally {
                 bitmap.recycle()
             }
-            indexedImages.mapNotNull { photo ->
-                val vec = embeddingCacheByUri[photo.uri]?.vector
-                    ?: photo.embedding.takeIf { it.size >= 4 }?.toFloatArray()
-                    ?: return@mapNotNull null
-                photo to memoriaEncoder.cosineSimilarity(encodedImage, vec)
-            }.sortedByDescending { it.second }
+        }
+        return withContext(Dispatchers.Default) {
+            val cores = Runtime.getRuntime().availableProcessors()
+            val chunkCount = cores.coerceAtMost(indexedImages.size).coerceAtLeast(1)
+            val chunkSize = (indexedImages.size + chunkCount - 1) / chunkCount
+            val chunks = indexedImages.chunked(chunkSize)
+
+            val allScoredLists: List<List<Pair<PhotoEntity, Float>>> = chunks.map { chunk ->
+                async {
+                    val scored = ArrayList<Pair<PhotoEntity, Float>>()
+                    for (photo in chunk) {
+                        val vec = embeddingCacheByUri[photo.uri]?.vector
+                            ?: photo.embedding.takeIf { it.size >= 4 }?.toFloatArray()
+                            ?: continue
+                        val score = memoriaEncoder.cosineSimilarity(encodedImage, vec)
+                        if (score >= 0.25f) {
+                            scored.add(photo to score)
+                        }
+                    }
+                    scored.sortByDescending { it.second }
+                    scored
+                }
+            }.awaitAll()
+
+            val merged = mergeSortedDescending(allScoredLists)
+            val filtered = merged.filter { it.second >= confidence.imageScore }
+                .take(confidence.maxImageResults)
+            if (filtered.isNotEmpty()) {
+                filtered
+            } else {
+                merged.take(30)
+            }
         }
     }
 
@@ -356,7 +516,7 @@ class PhotoRepository(private val appContext: Context) {
         cameraModel: String?
     ) {
         if (alreadyExists(uri)) return
-        insertEmbeddingFast(uri, embedding, height, width, dateTaken, folderPath, cameraMake, cameraModel)
+        insertEmbeddingFast(uri, embedding, height, width, dateTaken, cameraMake = cameraMake, cameraModel = cameraModel, folderPath = folderPath)
     }
 
     suspend fun alreadyExists(uri: String): Boolean = dao.existsByUri(uri) != null
