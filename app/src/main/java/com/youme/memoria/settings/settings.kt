@@ -25,13 +25,15 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.chip.Chip
+import com.google.android.material.chip.ChipGroup
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.android.material.progressindicator.LinearProgressIndicator
 import com.youme.memoria.BuildConfig
 import com.youme.memoria.Gallery.IndexingViewModel
 import com.youme.memoria.Gallery.IndexingViewModelFactory
-import com.youme.memoria.PhotoRepository
+import com.youme.memoria.MediaScannerHelper
+import com.youme.memoria.MemoriaApp
 import com.youme.memoria.R
 import com.youme.memoria.roomCach.IndexBackupManager
 import com.youme.memoria.settings.FoldersManager.FoldersManager
@@ -44,7 +46,8 @@ import java.util.Locale
 
 class SettingsFragment : Fragment(R.layout.settings_layout) {
     private val indexingViewModel: IndexingViewModel by activityViewModels {
-        IndexingViewModelFactory(PhotoRepository(requireContext()), requireContext().applicationContext)
+        val app = requireContext().applicationContext as MemoriaApp
+        IndexingViewModelFactory(app.repo, app)
     }
 
     private val notificationPermissionLauncher =
@@ -83,12 +86,72 @@ class SettingsFragment : Fragment(R.layout.settings_layout) {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         setupGeneralSettings()
+        setupSpeedAndThermalSettings()
         setupFolders()
         setupBackupAndRestore()
         setupIndexingUi()
         setupUI()
         setUpAppVersion()
         openRepo()
+    }
+
+    private fun setupSpeedAndThermalSettings() {
+        val chipGroup = requireView().findViewById<ChipGroup>(R.id.speedChipGroup)
+        val chipEco = requireView().findViewById<Chip>(R.id.chipSpeedEco)
+        val chipBalanced = requireView().findViewById<Chip>(R.id.chipSpeedBalanced)
+        val chipFast = requireView().findViewById<Chip>(R.id.chipSpeedFast)
+        val speedDesc = requireView().findViewById<TextView>(R.id.speedDescText)
+        val chargingSwitch = requireView().findViewById<MaterialSwitch>(R.id.chargingCooldownSwitch)
+
+        fun descriptionFor(speed: IndexingSpeed): String = when (speed) {
+            IndexingSpeed.ECO -> "Eco: lowest heat for active phone use or warm rooms"
+            IndexingSpeed.BALANCED -> "Balanced: smooth pacing to keep your phone comfortable"
+            IndexingSpeed.FAST -> "Fast: maximum indexing speed when unplugged and cool"
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                launch {
+                    SettingsPrefs.getIndexingSpeed(requireContext()).collectLatest { speed ->
+                        val targetId = when (speed) {
+                            IndexingSpeed.ECO -> chipEco.id
+                            IndexingSpeed.BALANCED -> chipBalanced.id
+                            IndexingSpeed.FAST -> chipFast.id
+                        }
+                        if (chipGroup.checkedChipId != targetId) {
+                            chipGroup.check(targetId)
+                        }
+                        speedDesc.text = descriptionFor(speed)
+                    }
+                }
+                launch {
+                    SettingsPrefs.getChargingCooldown(requireContext()).collectLatest { enabled ->
+                        if (chargingSwitch.isChecked != enabled) {
+                            chargingSwitch.isChecked = enabled
+                        }
+                    }
+                }
+            }
+        }
+
+        chipGroup.setOnCheckedStateChangeListener { _, checkedIds ->
+            val selected = when (checkedIds.firstOrNull()) {
+                R.id.chipSpeedEco -> IndexingSpeed.ECO
+                R.id.chipSpeedBalanced -> IndexingSpeed.BALANCED
+                R.id.chipSpeedFast -> IndexingSpeed.FAST
+                else -> return@setOnCheckedStateChangeListener
+            }
+            speedDesc.text = descriptionFor(selected)
+            viewLifecycleOwner.lifecycleScope.launch {
+                SettingsPrefs.setIndexingSpeed(requireContext(), selected)
+            }
+        }
+
+        chargingSwitch.setOnCheckedChangeListener { _, isChecked ->
+            viewLifecycleOwner.lifecycleScope.launch {
+                SettingsPrefs.setChargingCooldown(requireContext(), isChecked)
+            }
+        }
     }
 
     private fun setupBackupAndRestore() {
@@ -98,7 +161,7 @@ class SettingsFragment : Fragment(R.layout.settings_layout) {
         backupBtn.setOnClickListener {
             indexingViewModel.pause()
             val stamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
-            exportIndexLauncher.launch("memoria_index_$stamp.db")
+            exportIndexLauncher.launch("wamemoria_index_$stamp.db")
         }
 
         restoreBtn.setOnClickListener {
@@ -108,21 +171,23 @@ class SettingsFragment : Fragment(R.layout.settings_layout) {
     }
 
     private fun performBackup(destUri: Uri) {
+        val appCtx = requireContext().applicationContext
         val backupBtn = view?.findViewById<MaterialButton>(R.id.backupIndexBtn)
         backupBtn?.isEnabled = false
         viewLifecycleOwner.lifecycleScope.launch {
-            val result = IndexBackupManager.exportIndex(requireContext(), destUri)
-            backupBtn?.isEnabled = true
+            val result = IndexBackupManager.exportIndex(appCtx, destUri)
+            if (!isAdded) return@launch
+            view?.findViewById<MaterialButton>(R.id.backupIndexBtn)?.isEnabled = true
             result.onSuccess { count ->
                 indexingViewModel.getFormattedDatabaseSize("photo_db")
                 Toast.makeText(
-                    requireContext(),
+                    appCtx,
                     "Backed up $count indexed photos successfully",
                     Toast.LENGTH_LONG
                 ).show()
             }.onFailure { err ->
                 Toast.makeText(
-                    requireContext(),
+                    appCtx,
                     "Backup failed: ${err.message ?: "Unknown error"}",
                     Toast.LENGTH_LONG
                 ).show()
@@ -133,24 +198,26 @@ class SettingsFragment : Fragment(R.layout.settings_layout) {
     private fun confirmAndPerformRestore(srcUri: Uri) {
         MaterialAlertDialogBuilder(requireContext())
             .setTitle("Restore Index Backup?")
-            .setMessage("This will replace your current local photo index with the selected backup file and restart Memoria.")
+            .setMessage("This will replace your current local photo index with the selected backup file and restart WAmemoria.")
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Restore") { _, _ ->
+                val appCtx = requireContext().applicationContext
                 val restoreBtn = view?.findViewById<MaterialButton>(R.id.restoreIndexBtn)
                 restoreBtn?.isEnabled = false
                 viewLifecycleOwner.lifecycleScope.launch {
-                    val result = IndexBackupManager.importIndex(requireContext(), srcUri)
-                    restoreBtn?.isEnabled = true
+                    val result = IndexBackupManager.importIndex(appCtx, srcUri)
+                    if (!isAdded) return@launch
+                    view?.findViewById<MaterialButton>(R.id.restoreIndexBtn)?.isEnabled = true
                     result.onSuccess { count ->
+                        MediaScannerHelper.invalidateCache()
                         Toast.makeText(
-                            requireContext(),
+                            appCtx,
                             "Restored $count indexed photos! Restarting...",
                             Toast.LENGTH_LONG
                         ).show()
                         delay(600)
-                        val ctx = requireContext().applicationContext
-                        val launchIntent = ctx.packageManager
-                            .getLaunchIntentForPackage(ctx.packageName)
+                        val launchIntent = appCtx.packageManager
+                            .getLaunchIntentForPackage(appCtx.packageName)
                             ?.apply {
                                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
                             }
@@ -160,7 +227,7 @@ class SettingsFragment : Fragment(R.layout.settings_layout) {
                         Runtime.getRuntime().exit(0)
                     }.onFailure { err ->
                         Toast.makeText(
-                            requireContext(),
+                            appCtx,
                             "Restore failed: ${err.message ?: "Invalid backup file"}",
                             Toast.LENGTH_LONG
                         ).show()
@@ -260,7 +327,7 @@ class SettingsFragment : Fragment(R.layout.settings_layout) {
                                 progressBar.max = state.total
                                 progressBar.progress = state.processed
 
-                                etaLog.text = "${(state.processed * 100) / state.total}%"
+                                etaLog.text = if (state.total > 0) "${(state.processed * 100) / state.total}%" else "0%"
 
                                 resumeBt.apply {
                                     isEnabled = true
@@ -278,11 +345,10 @@ class SettingsFragment : Fragment(R.layout.settings_layout) {
                                 progressBar.max = state.total
                                 progressBar.progress = state.processed
 
+                                val pct = if (state.total > 0) (state.processed * 100) / state.total else 0
                                 etaLog.apply {
                                     isVisible = true
-                                    text = "${(state.processed * 100) / state.total}%  ETA: ${
-                                        formatEta(state.etaMinutes.toLong())
-                                    }"
+                                    text = "$pct%  ETA: ${formatEta(state.etaMinutes.toLong())}"
                                 }
 
                                 pauseBt.apply {
