@@ -28,6 +28,7 @@ import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.progressindicator.LinearProgressIndicator
+import com.youme.memoria.MemoriaApp
 import com.youme.memoria.PhotoRepository
 import com.youme.memoria.R
 import com.youme.memoria.imageViewer.imageViewerActivity
@@ -42,12 +43,13 @@ class GalleryFragement : Fragment(R.layout.gallery_layout) {
     private lateinit var Adapter: GalleryDateAdapter
 
     private lateinit var repo: PhotoRepository
-    private lateinit var observer: GalleryObserver
+    private var observer: GalleryObserver? = null
     private var imageEncodingJob: Job? = null
     private val imglist = mutableListOf<Uri>()
 
     private val indexingViewModel: IndexingViewModel by activityViewModels {
-        IndexingViewModelFactory(repo, requireContext().applicationContext)
+        val app = requireContext().applicationContext as MemoriaApp
+        IndexingViewModelFactory(app.repo, app)
     }
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -57,7 +59,7 @@ class GalleryFragement : Fragment(R.layout.gallery_layout) {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-        repo = PhotoRepository(requireContext())
+        repo = (requireContext().applicationContext as MemoriaApp).repo
 
         Adapter = GalleryDateAdapter { uri ->
             viewLifecycleOwner.lifecycleScope.launch {
@@ -77,20 +79,30 @@ class GalleryFragement : Fragment(R.layout.gallery_layout) {
 
         recyclerView.apply {
             this.layoutManager = layoutManager
+            itemAnimator = null
+            setItemViewCacheSize(6)
             adapter = Adapter
         }
 
-        observer = GalleryObserver(Handler(Looper.getMainLooper()))
-
+        val contentObserver = GalleryObserver(Handler(Looper.getMainLooper()))
+        observer = contentObserver
         requireContext().contentResolver.registerContentObserver(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
             true,
-            observer
+            contentObserver
         )
 
         loadGallery()
         indexingState()
         navigateToSearch()
+    }
+
+    override fun onDestroyView() {
+        observer?.let {
+            runCatching { requireContext().contentResolver.unregisterContentObserver(it) }
+        }
+        observer = null
+        super.onDestroyView()
     }
 
     private fun loadGallery() {
@@ -153,7 +165,7 @@ class GalleryFragement : Fragment(R.layout.gallery_layout) {
                 SettingsPrefs.getIndicatorStatus(requireContext()).collectLatest { status ->
                     largeIndicatorBox.isVisible = !status
                     smallIndicatorBox.isVisible = status
-                    toolbar.title = if (status) "" else "Memoria"
+                    toolbar.title = if (status) "" else "WAmemoria"
                 }
             }
 
@@ -238,7 +250,7 @@ class GalleryFragement : Fragment(R.layout.gallery_layout) {
                 scaleY = 0f
             }
             toolbar?.apply {
-                title = "Memoria"
+                title = "WAmemoria"
             }
             hiddenView.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
         }.start()
