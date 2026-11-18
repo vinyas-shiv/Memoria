@@ -18,11 +18,14 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.stateIn
 
-enum class SearchLayout { STAGGERED, DATEBLOCKS }
+enum class SearchLayout { DATEBLOCKS, DATE_NEWEST, STAGGERED }
 
 sealed class SearchState {
     object Loading : SearchState()
-    data class Success(val results: List<Pair<PhotoEntity, Float>>) : SearchState()
+    data class Success(
+        val results: List<Pair<PhotoEntity, Float>>,
+        val dateGroups: List<SearchDateGroup> = emptyList()
+    ) : SearchState()
     data class Error(val message: String) : SearchState()
 }
 
@@ -31,7 +34,8 @@ class SearchViewModuel(application: Application) : AndroidViewModel(application)
     private val searchQuery = MutableStateFlow("")
     val searchImage = MutableStateFlow<Uri?>(null)
 
-    val searchLayout = MutableStateFlow<SearchLayout>(SearchLayout.STAGGERED)
+    val searchLayout = MutableStateFlow<SearchLayout>(SearchLayout.DATEBLOCKS)
+    val expandedDays = MutableStateFlow<Set<String>>(emptySet())
 
     val weightsSearch = MutableStateFlow<ByteArray>(ByteArray(0))
     val searchfilters = MutableStateFlow<SearchFilters>(SearchFilters(null, null, emptyList(), null))
@@ -49,21 +53,30 @@ class SearchViewModuel(application: Application) : AndroidViewModel(application)
             val textQuery = query.first
             val imageUri = query.second
             if (imageUri == null && textQuery.isBlank()) {
-                return@toSearchStates emptyList()
+                return@toSearchStates emptyList<Pair<PhotoEntity, Float>>() to emptyList<SearchDateGroup>()
             }
             val allImages = repo.indexedImagesFiltered(filters)
             if (allImages.isEmpty()) {
-                return@toSearchStates emptyList()
+                return@toSearchStates emptyList<Pair<PhotoEntity, Float>>() to emptyList<SearchDateGroup>()
             }
-            if (imageUri == null) {
+            val matched = if (imageUri == null) {
                 repo.ensureTextModelInitialized()
                 repo.search(textQuery, allImages, filters.confidence.score)
             } else {
-                repo.searchByImage(application, imageUri, allImages)
+                repo.searchByImage(application, imageUri, allImages, filters.confidence)
             }
-        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SearchState.Success(emptyList()))
+            val dateGroups = repo.buildSearchDateGroups(matched)
+            matched to dateGroups
+        }.stateIn(
+            viewModelScope,
+            SharingStarted.WhileSubscribed(5000),
+            SearchState.Success(emptyList(), emptyList())
+        )
 
     fun setSearchQuery(query: String) {
+        if (searchQuery.value != query) {
+            expandedDays.value = emptySet()
+        }
         searchQuery.value = query
     }
 
@@ -72,20 +85,29 @@ class SearchViewModuel(application: Application) : AndroidViewModel(application)
     }
 
     fun setSearchImage(image: Uri?) {
+        if (searchImage.value != image) {
+            expandedDays.value = emptySet()
+        }
         searchImage.value = image
     }
 
     fun setSearchLayout(searchLayout: SearchLayout) {
         this.searchLayout.value = searchLayout
     }
+
+    fun toggleDayExpanded(dayKey: String) {
+        val current = expandedDays.value
+        expandedDays.value = if (dayKey in current) current - dayKey else current + dayKey
+    }
 }
 
 internal fun <T> Flow<T>.toSearchStates(
-    search: suspend (T) -> List<Pair<PhotoEntity, Float>>
+    search: suspend (T) -> Pair<List<Pair<PhotoEntity, Float>>, List<SearchDateGroup>>
 ): Flow<SearchState> = flatMapLatest { input ->
     flow<SearchState> {
         emit(SearchState.Loading)
-        emit(SearchState.Success(search(input)))
+        val (matches, groups) = search(input)
+        emit(SearchState.Success(matches, groups))
     }.catch { e ->
         emit(SearchState.Error(e.message ?: "search failed"))
     }
