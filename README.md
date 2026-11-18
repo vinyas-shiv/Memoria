@@ -57,6 +57,7 @@ You type:  "my dog with a hat"          You show a photo of a chair
 
 ## What's New in WAmemoria
 
+- **Date-grouped search results** - Google Photos-style date-grouped search results (**By Date · Best Match** and **By Date · Newest**) with inline **See all photos from this day** expansion and match highlighting.
 - **Hidden `.nomedia` WhatsApp folder support** — Discover, view, and search `WhatsApp Images` (including `Sent/` and `Private/` subfolders, excluding video) via All Files Access.
 - **Strict selected-folder scoping** — Enforces selected folders consistently across the Photos gallery, viewer, indexer, and search, with non-destructive folder toggling that preserves stored embeddings.
 - **Local Backup Index & Restore Index** — Export and restore `wamemoria_index_YYYYMMDD_HHmm.db` with WAL checkpointing and SQLite integrity verification in **Settings → Storage**, plus persistent CI APK signing so updates install in-place without losing your index.
