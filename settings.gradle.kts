@@ -20,6 +20,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Memoria"
+rootProject.name = "WAmemoria"
 include(":app")
- 
