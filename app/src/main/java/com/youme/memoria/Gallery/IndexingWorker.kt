@@ -21,10 +21,13 @@ import com.youme.memoria.MainActivity
 import com.youme.memoria.MediaScannerHelper
 import com.youme.memoria.MemoriaApp
 import com.youme.memoria.R
-import kotlinx.coroutines.NonCancellable
+import com.youme.memoria.settings.IndexingSpeed
+import com.youme.memoria.settings.SettingsPrefs
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlin.time.Duration.Companion.milliseconds
 
@@ -35,10 +38,20 @@ class IndexingWorker(
 
     private val repo = (context.applicationContext as MemoriaApp).repo
 
-    override suspend fun getForegroundInfo() = foregroundInfo(0, 0)
+    @Volatile private var currentSpeed: IndexingSpeed = IndexingSpeed.BALANCED
+    @Volatile private var chargingCooldownEnabled: Boolean = true
+
+    override suspend fun getForegroundInfo() = foregroundInfo(0, 0, currentSpeed)
+
+    private suspend fun refreshSpeedPrefs() {
+        val appCtx = context.applicationContext
+        currentSpeed = SettingsPrefs.getIndexingSpeed(appCtx).first()
+        chargingCooldownEnabled = SettingsPrefs.getChargingCooldown(appCtx).first()
+    }
 
     override suspend fun doWork(): Result {
-        setForeground(foregroundInfo(0, 0))
+        refreshSpeedPrefs()
+        setForeground(foregroundInfo(0, 0, currentSpeed))
         try {
             MediaScannerHelper.invalidateCache()
             val existing: HashSet<String> =
@@ -57,7 +70,10 @@ class IndexingWorker(
             toProcess.forEachIndexed { index, uri ->
                 if (isStopped) return Result.success()
                 coroutineContext.ensureActive()
-                val startTime = System.currentTimeMillis()
+                if (index % 5 == 0) {
+                    refreshSpeedPrefs()
+                }
+                val iterStartMs = SystemClock.elapsedRealtime()
 
                 try {
                     val (encodedImage, sizeData) = repo.encodeImageWithDimensions(context, uri)
@@ -73,19 +89,9 @@ class IndexingWorker(
                         cameraMake = cameraInfo.first,
                         cameraModel = cameraInfo.second
                     )
-                    val took = (System.currentTimeMillis() - startTime).toFloat()
-                    avgMsPerImage = if (avgMsPerImage == 0f) took else avgMsPerImage * 0.95f + took * 0.05f
 
                     done++
                     existing.add(uri.toString())
-
-                    val nowElapsed = SystemClock.elapsedRealtime()
-                    if (nowElapsed - lastUiUpdateMs >= UI_UPDATE_INTERVAL_MS || index == toProcess.lastIndex) {
-                        lastUiUpdateMs = nowElapsed
-                        prvEtaMs = (avgMsPerImage * (toProcess.size - index - 1)).toLong()
-                        setProgress(workDataOf(KEY_DONE to done, KEY_TOTAL to all.size, KEY_ETA to prvEtaMs))
-                        setForeground(foregroundInfo(done, all.size))
-                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Throwable) {
@@ -93,16 +99,78 @@ class IndexingWorker(
                     repo.markAsFailed(uri.toString())
                 }
 
-                if (index % 10 == 0 || index == toProcess.lastIndex) {
-                    val etaMs = (avgMsPerImage * (toProcess.size - index - 1)).toLong()
-                    prvEtaMs = etaMs
-                    throttleIfHot()
+                // Apply user-configured speed pacing + charging/thermal protection before measuring full-step duration
+                applySpeedAndThermalPacing(index == toProcess.lastIndex)
+
+                val iterTook = (SystemClock.elapsedRealtime() - iterStartMs).toFloat()
+                avgMsPerImage = if (avgMsPerImage == 0f) iterTook else avgMsPerImage * 0.9f + iterTook * 0.1f
+
+                val nowElapsed = SystemClock.elapsedRealtime()
+                if (nowElapsed - lastUiUpdateMs >= UI_UPDATE_INTERVAL_MS || index == toProcess.lastIndex) {
+                    lastUiUpdateMs = nowElapsed
+                    prvEtaMs = (avgMsPerImage * (toProcess.size - index - 1)).toLong()
+                    setProgress(workDataOf(KEY_DONE to done, KEY_TOTAL to all.size, KEY_ETA to prvEtaMs))
+                    setForeground(foregroundInfo(done, all.size, currentSpeed))
                 }
             }
             return Result.success(workDataOf(KEY_DONE to done))
         } finally {
-            // Release only the image encoder after indexing so the shared text encoder stays warm for search
             withContext(NonCancellable) { repo.unloadImageModel() }
+        }
+    }
+
+    private fun readBatteryState(): Pair<Float, Boolean> {
+        val batteryStatus = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val tempTenths = batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+        val plugged = batteryStatus?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
+        return (tempTenths / 10.0f) to (plugged != 0)
+    }
+
+    fun getThermalStatus(tempCelsius: Float): ThermalStatus {
+        return when {
+            tempCelsius < 35f -> ThermalStatus.GREEN
+            tempCelsius < 42f -> ThermalStatus.ORANGE
+            else -> ThermalStatus.RED
+        }
+    }
+
+    fun getBatteryTemperature(): Float = readBatteryState().first
+
+    private suspend fun applySpeedAndThermalPacing(isLastItem: Boolean) {
+        if (isLastItem) return
+
+        val speed = currentSpeed
+        val (tempC, isPlugged) = readBatteryState()
+        val extraChargeThrottle = isPlugged && chargingCooldownEnabled
+
+        val baseDelayMs = when (speed) {
+            IndexingSpeed.ECO -> if (extraChargeThrottle) 600L else 350L
+            IndexingSpeed.BALANCED -> if (extraChargeThrottle) 280L else 120L
+            IndexingSpeed.FAST -> if (extraChargeThrottle) 140L else 0L
+        }
+
+        val redPauseThreshold = when {
+            extraChargeThrottle || speed == IndexingSpeed.ECO -> 38.5f
+            speed == IndexingSpeed.BALANCED -> 40.0f
+            else -> 42.0f
+        }
+        val orangeSlowThreshold = if (extraChargeThrottle || speed == IndexingSpeed.ECO) 34.5f else 35.0f
+
+        if (tempC >= redPauseThreshold) {
+            val resumeBelow = redPauseThreshold - 1.0f
+            while (readBatteryState().first >= resumeBelow) {
+                if (isStopped) return
+                delay(4000.milliseconds)
+            }
+        } else if (tempC >= orangeSlowThreshold) {
+            val thermalExtraMs = when (speed) {
+                IndexingSpeed.ECO -> 300L
+                IndexingSpeed.BALANCED -> 200L
+                IndexingSpeed.FAST -> 120L
+            }
+            delay((baseDelayMs + thermalExtraMs).milliseconds)
+        } else if (baseDelayMs > 0L) {
+            delay(baseDelayMs.milliseconds)
         }
     }
 
@@ -118,35 +186,12 @@ class IndexingWorker(
         )
     }
 
-    fun getThermalStatus(tempCelsius: Float): ThermalStatus {
-        return when {
-            tempCelsius < 35f -> ThermalStatus.GREEN
-            tempCelsius < 42f -> ThermalStatus.ORANGE
-            else -> ThermalStatus.RED
-        }
-    }
-
-    fun getBatteryTemperature(): Float {
-        val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-        val batteryStatus = context.registerReceiver(null, intentFilter)
-        val tempTenths = batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
-        return tempTenths / 10.0f
-    }
-
-    private suspend fun throttleIfHot() {
-        when (getThermalStatus(getBatteryTemperature())) {
-            ThermalStatus.RED -> while (getThermalStatus(getBatteryTemperature()) == ThermalStatus.RED) delay(5000.milliseconds)
-            ThermalStatus.ORANGE -> delay(800.milliseconds)
-            ThermalStatus.GREEN -> {}
-        }
-    }
-
-    private fun foregroundInfo(done: Int, total: Int): ForegroundInfo {
+    private fun foregroundInfo(done: Int, total: Int, speed: IndexingSpeed): ForegroundInfo {
         val pauseIntent = WorkManager.getInstance(applicationContext)
             .createCancelPendingIntent(id)
         val notif = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.baseline_image_search_24)
-            .setContentTitle("Indexing your photos")
+            .setContentTitle("Indexing photos (${speed.label})")
             .setContentText("$done / $total")
             .setProgress(total, done, total == 0)
             .setOngoing(true)
