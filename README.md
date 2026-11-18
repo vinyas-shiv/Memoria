@@ -1,17 +1,17 @@
 <div align="center">
-  <a href="https://github.com/raslenabb12/Memoria">
-    <img src="https://github.com/raslenabb12/Memoria/blob/master/app/src/main/res/mipmap-hdpi/ic_launcher_foreground.webp" alt="Memoria" width="200">
+  <a href="https://github.com/vinyas-shiv/WAmemoria">
+    <img src="https://github.com/vinyas-shiv/WAmemoria/blob/master/app/src/main/res/mipmap-hdpi/ic_launcher_foreground.webp" alt="Memoria" width="200">
   </a>
 
-# Memoria
+# WAmemoria
 
 **Search your photos with words — or with a photo. No cloud. No account. No data leaving your phone.**
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Android](https://img.shields.io/badge/Android-9.0%2B-green.svg)](https://android.com)
 [![TFLite](https://img.shields.io/badge/TFLite-MobileCLIP--S0-orange.svg)](https://github.com/apple/ml-mobileclip)
-[![Release](https://img.shields.io/github/v/release/raslenabb12/Memoria?include_prereleases)](https://github.com/raslenabb12/Memoria/releases)
-[![Stars](https://img.shields.io/github/stars/raslenabb12/Memoria?style=social)](https://github.com/raslenabb12/Memoria/stargazers)
+[![Release](https://img.shields.io/github/v/release/vinyas-shiv/WAmemoria?include_prereleases)](https://github.com/vinyas-shiv/WAmemoria/releases)
+[![Stars](https://img.shields.io/github/stars/vinyas-shiv/WAmemoria?style=social)](https://github.com/vinyas-shiv/WAmemoria/stargazers)
 
 [Screenshots](#screenshots) · [Features](#features) · [How it works](#how-it-works) · [Privacy](#privacy) · [Getting started](#getting-started) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
@@ -19,13 +19,13 @@
 
 ---
 
-## What is Memoria?
+## What is WAmemoria?
 
-Memoria is an open-source Android app that lets you search your photo gallery using natural language — type *"dog at the beach"*, *"birthday cake"*, or *"snowy mountains"* and it finds the right photos instantly.
+WAmemoria is a fork of [raslenabb12/Memoria](https://github.com/raslenabb12/Memoria) with WhatsApp .nomedia support, strict folder scoping, local index backup/restore, thermal/speed controls, and performance optimizations. WAmemoria is an open-source Android app that lets you search your photo gallery using natural language — type *"dog at the beach"*, *"birthday cake"*, or *"snowy mountains"* and it finds the right photos instantly.
 
-You can also search **with a photo instead of words** — pick one from anywhere, crop it to just the part you care about, or share an image from any other app straight into Memoria. Or open any photo and tap "Find Similar" to see more like it.
+You can also search **with a photo instead of words** — pick one from anywhere, crop it to just the part you care about, or share an image from any other app straight into WAmemoria. Or open any photo and tap "Find Similar" to see more like it.
 
-**Smart Albums (Experimental)** — create an album by name, seed it with a text search or a few reference photos, and Memoria will suggest similar photos to add as you keep indexing — all based on the same on-device embeddings.
+**Smart Albums (Experimental)** — create an album by name, seed it with a text search or a few reference photos, and WAmemoria will suggest similar photos to add as you keep indexing — all based on the same on-device embeddings.
 
 Everything runs **100% on-device** using Apple's MobileCLIP-S0 model converted to TFLite. No internet connection required after setup. Your photos never leave your phone.
 
@@ -55,6 +55,16 @@ You type:  "my dog with a hat"          You show a photo of a chair
 
 ---
 
+## What's New in WAmemoria
+
+- **Hidden `.nomedia` WhatsApp folder support** — Discover, view, and search `WhatsApp Images` (including `Sent/` and `Private/` subfolders, excluding video) via All Files Access.
+- **Strict selected-folder scoping** — Enforces selected folders consistently across the Photos gallery, viewer, indexer, and search, with non-destructive folder toggling that preserves stored embeddings.
+- **Local Backup Index & Restore Index** — Export and restore `wamemoria_index_YYYYMMDD_HHmm.db` with WAL checkpointing and SQLite integrity verification in **Settings → Storage**, plus persistent CI APK signing so updates install in-place without losing your index.
+- **Indexing Speed & Heat Control** — User-controllable **Eco (Cool)**, **Balanced**, and **Fast** presets and **Extra cooldown while charging** in **Settings → General**.
+- **Performance & lifecycle improvements** — RAM `FloatArray` embedding search cache, `RGB_565` thumbnail downsampling with `DiffUtil` and shared `RecycledViewPool` grid rendering, and lifecycle leak fixes.
+
+---
+
 ## Features
 
 **Search**
@@ -62,7 +72,7 @@ You type:  "my dog with a hat"          You show a photo of a chair
 - **Multilingual search** — search in English, Arabic, French, Russian or Spanish. Queries are understood directly by the text encoder, with no translation step.
 - **Search by photo** — pick one from anywhere and find visually similar photos in your gallery, no text needed.
 - **Crop to search** — crop a photo down to just a face, an object, or one corner of the scene, and search with only that part.
-- **Search from other apps** — share an image from any app, pick Memoria, and search your gallery without opening Memoria first.
+- **Search from other apps** — share an image from any app, pick WAmemoria, and search your gallery without opening WAmemoria first.
 - **Find Similar** — open any photo and find others like it with one tap, reusing the same embeddings your library is already indexed with.
 - **Search history** — recent searches are saved so you can rerun them in one tap. Pin the ones you use often, delete a single entry, or clear everything at any time.
 - **Confidence slider** — adjust the minimum match confidence for search results, from loose to strict.
@@ -90,7 +100,7 @@ You type:  "my dog with a hat"          You show a photo of a chair
 
 ## How it works
 
-Memoria uses **CLIP** (Contrastive Language–Image Pre-training), a neural network trained on 400 million image-text pairs. It maps both images and text into the *same* 512-dimensional vector space — meaning semantically similar things have similar vectors, regardless of whether they came from pixels or words. That shared space is what makes text search, search-by-photo, crop-to-search, and Find Similar all the same underlying operation:
+WAmemoria uses **CLIP** (Contrastive Language–Image Pre-training), a neural network trained on 400 million image-text pairs. It maps both images and text into the *same* 512-dimensional vector space — meaning semantically similar things have similar vectors, regardless of whether they came from pixels or words. That shared space is what makes text search, search-by-photo, crop-to-search, and Find Similar all the same underlying operation:
 
 ```
 Gallery photo  →  [Image Encoder]  →  512 floats  →  stored in Room DB
@@ -124,7 +134,7 @@ As of v1.7.0 the text encoder is a **custom-trained multilingual model** that un
 
 - No `INTERNET` permission, so the app cannot make network requests at all.
 - No account, no analytics, no ads.
-- App data is excluded from Android's automatic system backups. Your photo index and search history stay on the device. If you move to a new phone, Memoria reindexes your photos there.
+- App data is excluded from Android's automatic system backups. Your photo index and search history stay on the device. If you move to a new phone, WAmemoria reindexes your photos there.
 - Search history is stored locally and can be deleted per item or cleared entirely from the app.
 
 ---
@@ -139,13 +149,13 @@ As of v1.7.0 the text encoder is a **custom-trained multilingual model** that un
 
 ### Install
 
-Grab the latest APK from the [Releases page](https://github.com/raslenabb12/Memoria/releases). Updates keep your existing index and albums, so you usually don't need to reindex. Check the release notes for any version that says otherwise.
+Grab the latest APK from the [Releases page](https://github.com/vinyas-shiv/WAmemoria/releases). Updates keep your existing index and albums, so you usually don't need to reindex. Check the release notes for any version that says otherwise.
 
 ### Build from source
 
 ```bash
-git clone https://github.com/raslenabb12/memoria.git
-cd memoria
+git clone https://github.com/vinyas-shiv/WAmemoria.git
+cd WAmemoria
 ```
 
 The model files are included in the repository, in `app/src/main/assets/`:
@@ -185,9 +195,9 @@ Then open in Android Studio and run.
 
 ## Contributing
 
-Issues and PRs are welcome. Use the bug report form when you file an issue: your device, Android version, app version, and roughly how many photos are in your library help a lot, and so does a screen recording or logcat output. For questions and feature ideas, use [Discussions](https://github.com/raslenabb12/Memoria/discussions).
+Issues and PRs are welcome. Use the bug report form when you file an issue: your device, Android version, app version, and roughly how many photos are in your library help a lot, and so does a screen recording or logcat output. For questions and feature ideas, use [Discussions](https://github.com/vinyas-shiv/WAmemoria/discussions).
 
-Memoria is a solo project maintained alongside my studies, so updates may be slower during the school year.
+WAmemoria is a solo project maintained alongside my studies, so updates may be slower during the school year.
 
 ---
 
